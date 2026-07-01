@@ -139,11 +139,86 @@ function jumpStep(path: ReadonlyArray<readonly [number, number]>, overrides: Par
   };
 }
 
+/**
+ * Cumulative hop-frame index of each step's own boundary (its last hop),
+ * given each step's own hop count -- mirrors `buildHopFrames`' internal
+ * indexing (renderSnake.ts) without needing to export it. `stepBoundary[0]`
+ * is frame 0 (the start position); `stepBoundary[s]` for `s >= 1` is the
+ * frame at which step `s` finishes moving.
+ */
+function stepBoundaryFrameIndices(steps: readonly SnakePathStep[]): number[] {
+  const indices = [0];
+  let cumulativeHops = 0;
+  for (let stepIndex = 1; stepIndex < steps.length; stepIndex += 1) {
+    cumulativeHops += Math.max(1, steps[stepIndex]!.waypoints.length - 1);
+    indices.push(cumulativeHops);
+  }
+  return indices;
+}
+
+/**
+ * Gap (px), at every step boundary, between a lagged body segment's actual
+ * (post-`clampToMaxSpeed`) rendered position and its *ideal* (unclamped)
+ * time-shifted target. At step boundary `s`, the ideal target for a segment
+ * lagging `stepLag` steps behind the head is exactly the head's own actual
+ * position at step boundary `s - stepLag` (or the start position, if that
+ * would be before the loop began) -- see `headPositionAtTime`/
+ * `laggedPositions` in renderSnake.ts, and the design-decision comment on
+ * `clampToMaxSpeed` for why this gap is not always zero.
+ */
+function gapsAtStepBoundaries(steps: readonly SnakePathStep[], svg: string, stepLag: number): number[] {
+  const boundaryFrame = stepBoundaryFrameIndices(steps);
+  const headPositions = parseNodePositions(svg, "wolverine-snake-head");
+  const bodyPositions = parseNodePositions(svg, `wolverine-snake-body-${stepLag - 1}`);
+  const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);
+  return steps.map((_, stepIndex) => {
+    const idealSourceStep = Math.max(stepIndex - stepLag, 0);
+    const ideal = headPositions[boundaryFrame[idealSourceStep]!]!;
+    const actual = bodyPositions[boundaryFrame[stepIndex]!]!;
+    return distance(ideal, actual);
+  });
+}
+
 function totalDurationOf(svg: string): number {
   const match = svg.match(/dur="(\d+)ms"/);
   if (!match) throw new Error("no dur attribute found");
   return Number(match[1]);
 }
+
+/**
+ * Reproduces QA's exact repro shape: a long jump (many hops) immediately
+ * followed by a very short step. Before the time-shift fix, a lagged body
+ * segment replayed the long jump's whole route within the short step's tiny
+ * real-time budget, snapping across most of the board in a single frame.
+ */
+const longJumpThenShortStepSteps: SnakePathStep[] = [
+  jumpStep([[0, 0]]),
+  jumpStep([
+    [0, 0],
+    [1, 0],
+    [2, 0],
+    [3, 0],
+    [4, 0],
+    [5, 0],
+    [6, 0],
+    [7, 0],
+    [8, 0],
+    [9, 0],
+    [10, 0],
+  ]), // 10-hop jump
+  jumpStep([
+    [10, 0],
+    [10, 1],
+  ]), // 1-hop step immediately after
+  jumpStep([
+    [10, 1],
+    [10, 2],
+  ]),
+  jumpStep([
+    [10, 2],
+    [10, 3],
+  ]),
+];
 
 describe("renderSnake", () => {
   it("returns an empty string when there are no steps", () => {
@@ -272,42 +347,6 @@ describe("renderSnake", () => {
   });
 
   describe("adversarial long-jump-then-short-step timing (QA repro)", () => {
-    /**
-     * Reproduces QA's exact repro shape: a long jump (many hops) immediately
-     * followed by a very short step. Before the time-shift fix, a lagged
-     * body segment replayed the long jump's whole route within the short
-     * step's tiny real-time budget, snapping across most of the board in a
-     * single frame.
-     */
-    const longJumpThenShortStepSteps: SnakePathStep[] = [
-      jumpStep([[0, 0]]),
-      jumpStep([
-        [0, 0],
-        [1, 0],
-        [2, 0],
-        [3, 0],
-        [4, 0],
-        [5, 0],
-        [6, 0],
-        [7, 0],
-        [8, 0],
-        [9, 0],
-        [10, 0],
-      ]), // 10-hop jump
-      jumpStep([
-        [10, 0],
-        [10, 1],
-      ]), // 1-hop step immediately after
-      jumpStep([
-        [10, 1],
-        [10, 2],
-      ]),
-      jumpStep([
-        [10, 2],
-        [10, 3],
-      ]),
-    ];
-
     it("never moves any body segment or connector endpoint faster than the head's own worst single hop", () => {
       const bodyLength = 3;
       const svg = renderSnake(longJumpThenShortStepSteps, bodyLength);
@@ -332,6 +371,108 @@ describe("renderSnake", () => {
 
       const svg = renderSnake(steps, bodyLength);
       expectNoSegmentFasterThanHead(svg, bodyLength);
+    });
+  });
+
+  describe("body-lag bounded-speed \"chase\" trade-off (see clampToMaxSpeed design-decision comment)", () => {
+    // Exact per-step-boundary alignment and a hard speed cap are jointly
+    // impossible whenever a long jump is immediately followed by an
+    // arbitrarily short step (there is provably not enough real time to
+    // cover the required ground at the speed limit). The project owner's
+    // call was to relax exact-boundary alignment and guarantee bounded-speed
+    // "chase" motion instead. These tests pin down exactly what that means:
+    // no NaN/backwards positions ever, the gap shrinks whenever slack time
+    // is available, and even with zero slack the steady-state error stays
+    // bounded rather than diverging.
+
+    it("never produces NaN, undefined, or non-finite positions, even for segments with more lag than the loop has history for", () => {
+      const bodyLength = 20; // deliberately more segments than there are steps
+      const svg = renderSnake(longJumpThenShortStepSteps, bodyLength);
+
+      for (let segment = 0; segment < bodyLength; segment += 1) {
+        const positions = parseNodePositions(svg, `wolverine-snake-body-${segment}`);
+        expect(positions.length).toBeGreaterThan(0);
+        for (const p of positions) {
+          expect(Number.isFinite(p.x)).toBe(true);
+          expect(Number.isFinite(p.y)).toBe(true);
+        }
+      }
+      for (let i = 0; i < bodyLength; i += 1) {
+        const { from, to } = parseConnectorEndpoints(svg, i);
+        for (const p of [...from, ...to]) {
+          expect(Number.isFinite(p.x)).toBe(true);
+          expect(Number.isFinite(p.y)).toBe(true);
+        }
+      }
+    });
+
+    it("shrinks the gap to the ideal time-shifted target across recovery steps after a hard jump-then-short transition, until fully resynced", () => {
+      const steps: SnakePathStep[] = [
+        jumpStep([[0, 0]]),
+        jumpStep([
+          [0, 0], [1, 0], [2, 0], [3, 0], [4, 0], [5, 0], [6, 0], [7, 0], [8, 0], [9, 0], [10, 0],
+        ]), // 10-hop jump
+        jumpStep([[10, 0], [10, 1]]), // 1-hop step immediately after -- this is the hard transition where the clamp engages
+        // Recovery slack: ordinary 1-hop steps that don't demand another hard
+        // catch-up, giving the clamped segment room to close the gap.
+        jumpStep([[10, 1], [10, 2]]),
+        jumpStep([[10, 2], [10, 3]]),
+        jumpStep([[10, 3], [10, 4]]),
+        jumpStep([[10, 4], [10, 5]]),
+        jumpStep([[10, 5], [10, 6]]),
+        jumpStep([[9, 6], [8, 6]]),
+        jumpStep([[8, 6], [7, 6]]),
+      ];
+      const svg = renderSnake(steps, 1);
+      const gaps = gapsAtStepBoundaries(steps, svg, 1);
+
+      const hardTransitionIndex = 2;
+      // Right after the hard transition, segment 0 is measurably behind its
+      // ideal target -- the mathematically-unavoidable gap QA proved.
+      expect(gaps[hardTransitionIndex]).toBeGreaterThan(50);
+
+      // Across every recovery step that follows, the gap must never grow or
+      // oscillate back up -- only shrink or (once resynced) hold at zero.
+      for (let i = hardTransitionIndex; i < gaps.length - 1; i += 1) {
+        expect(gaps[i + 1]).toBeLessThanOrEqual(gaps[i]! + 1e-9);
+      }
+      // It must also make real, strict progress and be fully resynced
+      // (within a tight tolerance) before the recovery steps run out.
+      expect(gaps.at(-1)!).toBeLessThan(gaps[hardTransitionIndex]!);
+      expect(gaps.at(-1)!).toBeLessThan(1e-6);
+    });
+
+    it("keeps the steady-state error bounded (not growing cycle over cycle) under a repeating hard jump/short-step pattern with no recovery slack", () => {
+      // QA's pathological shape: the jump/short-step hard transition repeats
+      // back-to-back, cycle after cycle, with no slack steps in between for
+      // the clamp to fully catch up on. This is the case where exact
+      // resync is impossible by construction -- what's guaranteed instead is
+      // that the offset settles into a stable, bounded steady state rather
+      // than growing without limit.
+      const steps: SnakePathStep[] = [jumpStep([[0, 0]])];
+      let week = 0;
+      let day = 0;
+      const cycleCount = 8;
+      for (let cycle = 0; cycle < cycleCount; cycle += 1) {
+        const jumpPath: Array<[number, number]> = [];
+        for (let hop = 0; hop <= 10; hop += 1) jumpPath.push([week + hop, day]);
+        week += 10;
+        steps.push(jumpStep(jumpPath)); // 10-hop jump
+        const nextDay = (day + 1) % 7;
+        steps.push(jumpStep([[week, day], [week, nextDay]])); // 1-hop step, immediately next -- no slack before the next cycle's jump
+        day = nextDay;
+      }
+
+      const svg = renderSnake(steps, 1);
+      const gaps = gapsAtStepBoundaries(steps, svg, 1);
+
+      // Step index of the "after short step" boundary for cycle c (0-indexed): 2*c + 2.
+      const secondCycleGap = gaps[2 * 1 + 2]!;
+      const eighthCycleGap = gaps[2 * (cycleCount - 1) + 2]!;
+
+      expect(secondCycleGap).toBeGreaterThan(0); // the hard pattern really does produce a persistent, non-zero offset
+      // The offset must be a stable, bounded steady state, not a divergence.
+      expect(eighthCycleGap).toBeCloseTo(secondCycleGap, 5);
     });
   });
 });

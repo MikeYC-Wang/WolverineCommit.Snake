@@ -194,9 +194,53 @@ function maxConsecutiveDistance(positions: readonly Point[]): number {
  * worst single hop even when the *ideal* time-shifted position would require
  * covering many hops within a single frame (e.g. a long jump immediately
  * followed by a very short step -- the exact shape QA's repro exercises).
- * Any distance this trims off is naturally caught up on subsequent frames,
- * since the ideal target keeps advancing independently of how far behind the
- * clamped trail currently sits.
+ * Any distance this trims off is made up as fast as the speed cap allows on
+ * subsequent frames, since the ideal target keeps advancing independently of
+ * how far behind the clamped trail currently sits.
+ *
+ * ## Design decision: bounded-speed "chase" motion, not exact-boundary alignment
+ *
+ * A hard speed cap and "body segment k sits exactly on the cell the head
+ * occupied k steps ago, at *every* step boundary" are mathematically
+ * incompatible whenever a long jump is immediately followed by an
+ * arbitrarily short step: the short step's real-time budget can be smaller
+ * than what covering the jump-sized gap at the head's own top speed would
+ * require, so there is provably not enough time to be both exactly-on-target
+ * and speed-capped at that boundary. QA proved this isn't a rare edge case --
+ * a minimal 3-step repro (a 10-hop jump followed by a 1-hop step, bodyLength
+ * 1) lands segment 0 up to 126px (9 grid cells) away from the "exact
+ * k-steps-ago" position, and sampling that same invariant across a realistic
+ * 53x7/296-step fixture found mismatches at 169/430 (39%) of sampled step
+ * boundaries across lags 1-10. A repeating long-jump/short-step pattern with
+ * no recovery slack between cycles was also shown to *not* self-correct: the
+ * same offset recurs identically cycle over cycle.
+ *
+ * The project owner's call, given that tension: relax the exact-boundary
+ * requirement and render body segments as bounded-speed "chase" motion
+ * instead -- the same organic, never-snapping trailing-segment look common
+ * to follow-the-leader "snake" animations, rather than teleporting or
+ * rigid-exact alignment. This only affects how body segments are *drawn*;
+ * `solveSnakePath.ts`'s grid-based occupancy/self-collision model is exact in
+ * its own abstract coordinate space and is untouched by this trade-off.
+ *
+ * What IS guaranteed instead (see the corresponding tests in
+ * renderSnake.test.ts):
+ *   1. Speed bound: no segment/connector endpoint ever exceeds the head's
+ *      own fastest observed px/ms (this function).
+ *   2. No NaN/undefined/backwards-time positions, ever -- including before a
+ *      segment has enough history for a real lagged target yet (see
+ *      `headPositionAtTime`'s clamping).
+ *   3. Convergence under slack: whenever a segment falls behind and the
+ *      steps that follow don't immediately demand another hard catch-up, the
+ *      gap to its ideal (unclamped) time-shifted target shrinks frame over
+ *      frame until it's fully resynced.
+ *   4. Bounded worst case: even under a pathological repeating hard
+ *      jump/short-step pattern with *no* recovery slack at all, the
+ *      steady-state error stays bounded rather than growing cycle over
+ *      cycle -- it settles into a stable offset, not a divergence.
+ * What is explicitly NOT guaranteed: exact pixel/cell alignment at every
+ * single step boundary under adversarial (mismatched-hop-count) adjacent
+ * steps.
  */
 function clampToMaxSpeed(positions: readonly Point[], maxDistancePx: number): Point[] {
   if (positions.length === 0) return [];
@@ -266,14 +310,16 @@ export function renderSnake(steps: readonly SnakePathStep[], bodyLength: number)
    * have very different hop counts -- see project report, "the snake body
    * snaps/teleports"), this reads the segment's position directly off the
    * head's own trajectory at (this frame's time minus the real duration of
-   * the `stepLag` most recent steps). That keeps the segment's motion an
-   * exact, undistorted echo of however the head actually moved, just shifted
-   * later in time. `clampToMaxSpeed` is a safety net for the rare case where
-   * the ideal time-shifted target would itself require covering more ground
-   * than the head's worst single hop within one frame (e.g. a long jump
-   * immediately followed by a very short step): it caps the segment's
-   * per-frame travel instead of letting it snap, and any shortfall is made up
-   * on subsequent frames as the ideal target keeps advancing.
+   * the `stepLag` most recent steps). That makes the *ideal* target an exact,
+   * undistorted echo of however the head actually moved, just shifted later
+   * in time -- but the position actually rendered is `clampToMaxSpeed`'s
+   * output, not that ideal target directly. `clampToMaxSpeed` caps the
+   * segment's per-frame travel whenever the ideal time-shifted target would
+   * itself require covering more ground than the head's worst single hop
+   * within one frame (e.g. a long jump immediately followed by a very short
+   * step -- not a rare case; see the design-decision note on
+   * `clampToMaxSpeed` for how often this actually happens and exactly what is
+   * and isn't guaranteed as a result).
    */
   function laggedPositions(stepLag: number): Point[] {
     const idealPositions = hopFrames.map((frame) => {
