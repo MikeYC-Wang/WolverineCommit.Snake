@@ -1,0 +1,27 @@
+{
+  "name": "wolverinecommit-snake",
+  "version": "1.0.0",
+  "description": "A Wolverine-themed animated SVG snake that eats its way through your GitHub contribution graph.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "bin": {
+    "wolverine-snake": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "generate": "npm run build && node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.4",
+    "vitest": "^1.6.0"
+  }
+}
