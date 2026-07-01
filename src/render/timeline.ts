@@ -1,3 +1,5 @@
+import type { SnakePathStep } from "../pathfinding/solveSnakePath.js";
+
 /**
  * Shared SMIL timeline math used by both renderSnake and renderEventBubble so
  * their `<animate>` elements stay in lockstep: every animated element in the
@@ -16,14 +18,41 @@ export interface LoopTimeline {
   readonly totalDurationMs: number;
 }
 
+/**
+ * Per-step travel duration in ms, proportional to how many grid-adjacent
+ * hops that step's actual route spans (`SnakePathStep.waypoints`), instead of
+ * a single flat duration for every step. Without this, a 1-cell move and a
+ * 20-cell jump animated in the same fixed window, which read as the snake
+ * "teleporting" across long jumps (see project report). Index 0 is the
+ * starting position -- there is no previous head to travel from, so it
+ * always costs 0ms.
+ */
+export function computeStepDurationsMs(
+  steps: readonly SnakePathStep[],
+  baseStepDurationMs: number,
+): number[] {
+  return steps.map((step, index) => {
+    if (index === 0) return 0;
+    const hopCount = Math.max(1, step.waypoints.length - 1);
+    return baseStepDurationMs * hopCount;
+  });
+}
+
+/**
+ * Builds the shared loop timeline from each step's own travel duration
+ * (see {@link computeStepDurationsMs}) rather than a single flat
+ * per-step duration, so steps that cover more ground get proportionally
+ * more of the timeline instead of all steps racing across in equal time.
+ */
 export function buildLoopTimeline(
-  stepCount: number,
-  stepDurationMs: number,
+  stepDurationsMs: readonly number[],
   loopResetPauseMs: number,
 ): LoopTimeline {
   const absoluteTimesMs: number[] = [];
-  for (let step = 0; step < stepCount; step += 1) {
-    absoluteTimesMs.push(step * stepDurationMs);
+  let cumulativeMs = 0;
+  for (const durationMs of stepDurationsMs) {
+    cumulativeMs += durationMs;
+    absoluteTimesMs.push(cumulativeMs);
   }
   const lastMoveTimeMs = absoluteTimesMs.at(-1) ?? 0;
   const pauseEndTimeMs = lastMoveTimeMs + loopResetPauseMs;

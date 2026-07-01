@@ -8,7 +8,7 @@ import {
   SNAKE_HEAD_BORDER,
   SNAKE_HEAD_FILL,
 } from "./theme.js";
-import { buildLoopTimeline, unwrapAngles } from "./timeline.js";
+import { buildLoopTimeline, computeStepDurationsMs, unwrapAngles } from "./timeline.js";
 
 const HEAD_SIZE_PX = 9;
 const HEAD_CORNER_RADIUS_PX = 2;
@@ -21,6 +21,22 @@ const ARROW_PATH = "M 3.5 0 L -1.5 -2.5 L -1.5 2.5 Z";
 interface Point {
   readonly x: number;
   readonly y: number;
+}
+
+/**
+ * One sub-frame of the head's travel within a step's own route. `stepIndex`
+ * identifies which `SnakePathStep` this hop belongs to; `hopIndex`/`hopCount`
+ * locate it within that step's `waypoints` (hop 0 is the step's starting
+ * cell, hop `hopCount` is its destination cell). Exposing this per-hop
+ * structure (rather than one frame per step) is what lets the head, body
+ * segments, and connectors all move through/near intermediate empty cells
+ * instead of cutting a straight line to the final destination.
+ */
+interface HopFrame {
+  readonly timeMs: number;
+  readonly stepIndex: number;
+  readonly hopIndex: number;
+  readonly hopCount: number;
 }
 
 function pointsEqual(a: Point, b: Point): boolean {
@@ -61,20 +77,82 @@ function rotateAnimation(anglesDeg: readonly number[], keyTimes: readonly number
 }
 
 /**
+ * Expands `steps` into one sub-frame per grid-adjacent hop along each step's
+ * `waypoints` route (see solveSnakePath.ts), instead of one frame per step.
+ * Every hop is budgeted exactly `baseStepDurationMs` -- the same per-hop
+ * price `computeStepDurationsMs` uses to size the shared timeline -- so a
+ * 1-cell step and a 20-cell jump both move across the board at the same
+ * on-screen speed, and a jump visibly passes through its intermediate empty
+ * cells instead of cutting a straight line across the board in a fixed
+ * 200ms window (see project report, "the snake teleports"). Step 0 (the
+ * starting cell) has no previous head to travel from, so it contributes a
+ * single zero-duration frame.
+ */
+function buildHopFrames(
+  steps: readonly SnakePathStep[],
+  absoluteTimesMs: readonly number[],
+  baseStepDurationMs: number,
+): HopFrame[] {
+  const frames: HopFrame[] = [{ timeMs: 0, stepIndex: 0, hopIndex: 0, hopCount: 0 }];
+  for (let stepIndex = 1; stepIndex < steps.length; stepIndex += 1) {
+    const step = steps[stepIndex]!;
+    const hopCount = Math.max(1, step.waypoints.length - 1);
+    const stepStartMs = absoluteTimesMs[stepIndex - 1]!;
+    for (let hopIndex = 1; hopIndex <= hopCount; hopIndex += 1) {
+      frames.push({ timeMs: stepStartMs + hopIndex * baseStepDurationMs, stepIndex, hopIndex, hopCount });
+    }
+  }
+  return frames;
+}
+
+/** Cell-center position at a given (stepIndex, hopIndex) into that step's own `waypoints`. */
+function waypointPosition(steps: readonly SnakePathStep[], stepIndex: number, hopIndex: number): Point {
+  const step = steps[stepIndex]!;
+  const waypointIndex = Math.min(hopIndex, step.waypoints.length - 1);
+  return cellCenter(step.waypoints[waypointIndex]!);
+}
+
+/**
+ * Position of a body segment lagged `stepLag` *steps* (not hops) behind the
+ * head, evaluated at the head's current `frame`. Body segments must lag by
+ * whole steps -- matching solveSnakePath's actual body-occupancy model,
+ * where each segment sits on a previously-*eaten* cell rather than a
+ * mid-route waypoint -- so this replays the shifted step's own waypoints at
+ * the same fractional hop-progress the head currently has within its own
+ * step, rather than jumping straight to the shifted step's destination cell.
+ */
+function laggedWaypointPosition(steps: readonly SnakePathStep[], frame: HopFrame, stepLag: number): Point {
+  const shiftedIndex = Math.max(0, frame.stepIndex - stepLag);
+  const shiftedStep = steps[shiftedIndex]!;
+  const shiftedHopCount = Math.max(0, shiftedStep.waypoints.length - 1);
+  if (shiftedHopCount === 0) return cellCenter(shiftedStep.waypoints[0]!);
+
+  const progress = frame.hopCount === 0 ? 0 : frame.hopIndex / frame.hopCount;
+  const shiftedHopIndex = Math.min(shiftedHopCount, Math.round(progress * shiftedHopCount));
+  return cellCenter(shiftedStep.waypoints[shiftedHopIndex]!);
+}
+
+/**
  * Renders the animated snake: a head (Command, with a rotating direction
  * arrow) trailed by `bodyLength` body nodes (message-bus segments), connected
  * by dashed connector lines. Movement between contributed cells is tweened
  * smoothly (see visual-design.md 2.3) rather than following grid lines, which
  * is why every node's position is driven by a single SMIL `translate`
- * animation interpolating directly between cell centers.
+ * animation interpolating through each step's waypoint route rather than
+ * jumping directly between cell centers.
  */
 export function renderSnake(steps: readonly SnakePathStep[], bodyLength: number): string {
   if (steps.length === 0) return "";
 
   const { stepDurationMs, loopResetPauseMs } = ANIMATION_TIMING;
-  const { keyTimes, totalDurationMs } = buildLoopTimeline(steps.length, stepDurationMs, loopResetPauseMs);
+  const stepDurationsMs = computeStepDurationsMs(steps, stepDurationMs);
+  const { absoluteTimesMs, totalDurationMs } = buildLoopTimeline(stepDurationsMs, loopResetPauseMs);
 
-  const headPositions = steps.map((step) => cellCenter(step.cell));
+  const hopFrames = buildHopFrames(steps, absoluteTimesMs, stepDurationMs);
+  const keyTimes = [...hopFrames.map((frame) => frame.timeMs), totalDurationMs].map((t) => t / totalDurationMs);
+  keyTimes[keyTimes.length - 1] = 1; // guard against floating point drift
+
+  const headPositions = hopFrames.map((frame) => waypointPosition(steps, frame.stepIndex, frame.hopIndex));
   const extendedHeadPositions = [...headPositions, headPositions.at(-1)!];
 
   const rawAngles = headPositions.map((position, index) => {
@@ -85,9 +163,10 @@ export function renderSnake(steps: readonly SnakePathStep[], bodyLength: number)
   const headAngles = unwrapAngles(rawAngles);
   const extendedHeadAngles = [...headAngles, headAngles.at(-1) ?? 0];
 
-  /** Position sequence of the body segment trailing `lag` steps behind the head. */
-  function laggedPositions(lag: number): Point[] {
-    return extendedHeadPositions.map((_, index) => extendedHeadPositions[Math.max(0, index - lag)]!);
+  /** Position sequence of the body segment trailing `stepLag` steps behind the head. */
+  function laggedPositions(stepLag: number): Point[] {
+    const positions = hopFrames.map((frame) => laggedWaypointPosition(steps, frame, stepLag));
+    return [...positions, positions.at(-1)!];
   }
 
   const headGroup = `
