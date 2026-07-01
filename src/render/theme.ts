@@ -44,6 +44,15 @@ export const ANIMATION_TIMING = {
   },
   /** Pause after a full loop completes, before the snake resets to its start cell. */
   loopResetPauseMs: 1500,
+  /**
+   * Fade duration (in and out) for a grid cell's "eaten" color transition
+   * (see renderGrid.ts). Not one of visual-design.md's documented timings --
+   * that doc predates the grid layer animating at all -- chosen to be quick
+   * enough to read as an instant reaction to the snake passing over, but
+   * slow enough (vs. an instant color swap) to be clearly perceptible at
+   * ~11px cell scale.
+   */
+  cellEatenFadeMs: 250,
 } as const;
 
 /** Minimum/maximum bubble radius (px), scaled by contribution level 1-4. See visual-design.md 2.3. */

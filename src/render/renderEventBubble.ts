@@ -9,7 +9,7 @@ import {
   EVENT_CONNECTOR_COLOR,
   EVENT_CONNECTOR_OPACITY,
 } from "./theme.js";
-import { buildLoopTimeline } from "./timeline.js";
+import { buildLoopTimeline, computeStepDurationsMs } from "./timeline.js";
 
 interface Point {
   readonly x: number;
@@ -80,11 +80,8 @@ export function renderEventBubble(
   if (steps.length === 0) return "";
 
   const { stepDurationMs, loopResetPauseMs, eventBubble } = ANIMATION_TIMING;
-  const { absoluteTimesMs, totalDurationMs } = buildLoopTimeline(
-    steps.length,
-    stepDurationMs,
-    loopResetPauseMs,
-  );
+  const stepDurationsMs = computeStepDurationsMs(steps, stepDurationMs);
+  const { absoluteTimesMs, totalDurationMs } = buildLoopTimeline(stepDurationsMs, loopResetPauseMs);
 
   const headPositions = steps.map((step) => cellCenter(step.cell));
 

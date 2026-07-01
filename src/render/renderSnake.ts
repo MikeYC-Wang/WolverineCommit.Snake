@@ -8,7 +8,7 @@ import {
   SNAKE_HEAD_BORDER,
   SNAKE_HEAD_FILL,
 } from "./theme.js";
-import { buildLoopTimeline, unwrapAngles } from "./timeline.js";
+import { buildLoopTimeline, computeStepDurationsMs, unwrapAngles } from "./timeline.js";
 
 const HEAD_SIZE_PX = 9;
 const HEAD_CORNER_RADIUS_PX = 2;
@@ -21,6 +21,22 @@ const ARROW_PATH = "M 3.5 0 L -1.5 -2.5 L -1.5 2.5 Z";
 interface Point {
   readonly x: number;
   readonly y: number;
+}
+
+/**
+ * One sub-frame of the head's travel within a step's own route. `stepIndex`
+ * identifies which `SnakePathStep` this hop belongs to; `hopIndex`/`hopCount`
+ * locate it within that step's `waypoints` (hop 0 is the step's starting
+ * cell, hop `hopCount` is its destination cell). Exposing this per-hop
+ * structure (rather than one frame per step) is what lets the head, body
+ * segments, and connectors all move through/near intermediate empty cells
+ * instead of cutting a straight line to the final destination.
+ */
+interface HopFrame {
+  readonly timeMs: number;
+  readonly stepIndex: number;
+  readonly hopIndex: number;
+  readonly hopCount: number;
 }
 
 function pointsEqual(a: Point, b: Point): boolean {
@@ -61,20 +77,212 @@ function rotateAnimation(anglesDeg: readonly number[], keyTimes: readonly number
 }
 
 /**
+ * Expands `steps` into one sub-frame per grid-adjacent hop along each step's
+ * `waypoints` route (see solveSnakePath.ts), instead of one frame per step.
+ * Every hop is budgeted exactly `baseStepDurationMs` -- the same per-hop
+ * price `computeStepDurationsMs` uses to size the shared timeline -- so a
+ * 1-cell step and a 20-cell jump both move across the board at the same
+ * on-screen speed, and a jump visibly passes through its intermediate empty
+ * cells instead of cutting a straight line across the board in a fixed
+ * 200ms window (see project report, "the snake teleports"). Step 0 (the
+ * starting cell) has no previous head to travel from, so it contributes a
+ * single zero-duration frame.
+ */
+function buildHopFrames(
+  steps: readonly SnakePathStep[],
+  absoluteTimesMs: readonly number[],
+  baseStepDurationMs: number,
+): HopFrame[] {
+  const frames: HopFrame[] = [{ timeMs: 0, stepIndex: 0, hopIndex: 0, hopCount: 0 }];
+  for (let stepIndex = 1; stepIndex < steps.length; stepIndex += 1) {
+    const step = steps[stepIndex]!;
+    const hopCount = Math.max(1, step.waypoints.length - 1);
+    const stepStartMs = absoluteTimesMs[stepIndex - 1]!;
+    for (let hopIndex = 1; hopIndex <= hopCount; hopIndex += 1) {
+      frames.push({ timeMs: stepStartMs + hopIndex * baseStepDurationMs, stepIndex, hopIndex, hopCount });
+    }
+  }
+  return frames;
+}
+
+/** Cell-center position at a given (stepIndex, hopIndex) into that step's own `waypoints`. */
+function waypointPosition(steps: readonly SnakePathStep[], stepIndex: number, hopIndex: number): Point {
+  const step = steps[stepIndex]!;
+  const waypointIndex = Math.min(hopIndex, step.waypoints.length - 1);
+  return cellCenter(step.waypoints[waypointIndex]!);
+}
+
+/**
+ * Real elapsed duration (ms) of the `stepLag` steps immediately preceding
+ * (and including) `stepIndex`, i.e. the amount of real time the head spent
+ * covering the same ground a `stepLag`-behind body segment must eventually
+ * retrace. Steps before index 0 don't exist, so the sum is naturally
+ * truncated (not padded) once it runs past the start of the loop -- see
+ * `headPositionAtTime`'s clamping for why that's the correct behavior rather
+ * than an approximation.
+ */
+function lagDurationMs(absoluteTimesMs: readonly number[], stepIndex: number, stepLag: number): number {
+  const endMs = absoluteTimesMs[stepIndex] ?? 0;
+  const startIndex = stepIndex - stepLag;
+  const startMs = startIndex >= 0 ? absoluteTimesMs[startIndex]! : 0;
+  return endMs - startMs;
+}
+
+/**
+ * Linearly interpolates the head's own position at an arbitrary absolute
+ * `timeMs`, given the head's full (monotonic) hop-keyframe timeline. This is
+ * the crux of the fix for body segments snapping (see module docs on
+ * `laggedPositions`): rather than replaying a *different* step's waypoints
+ * at the *current* step's fractional progress (which desyncs badly whenever
+ * the two steps have very different hop counts), we read the lagged
+ * position directly off the head's own continuous trajectory, evaluated
+ * `stepLag`-steps'-worth of real time in the past. `timeMs` before the first
+ * keyframe (i.e. before the loop even started) clamps to the start position,
+ * which is exactly the "not enough history yet" case at the top of a loop.
+ */
+function headPositionAtTime(times: readonly number[], positions: readonly Point[], timeMs: number): Point {
+  const lastIndex = times.length - 1;
+  const clampedTime = Math.min(Math.max(timeMs, times[0]!), times[lastIndex]!);
+
+  let low = 0;
+  let high = lastIndex;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (times[mid]! < clampedTime) low = mid + 1;
+    else high = mid;
+  }
+  if (low === 0 || times[low] === clampedTime) return positions[low]!;
+
+  const beforeTime = times[low - 1]!;
+  const afterTime = times[low]!;
+  const before = positions[low - 1]!;
+  const after = positions[low]!;
+  const span = afterTime - beforeTime;
+  const progress = span > 0 ? (clampedTime - beforeTime) / span : 0;
+  return {
+    x: before.x + (after.x - before.x) * progress,
+    y: before.y + (after.y - before.y) * progress,
+  };
+}
+
+/** Straight-line distance between two points. */
+function distanceBetween(a: Point, b: Point): number {
+  return Math.hypot(b.x - a.x, b.y - a.y);
+}
+
+/**
+ * The head's own worst per-frame travel distance (px), used as the hard
+ * speed ceiling every body segment/connector endpoint must respect (see
+ * module docs on `laggedPositions`). Every hop the head takes lands on an
+ * orthogonally-adjacent grid cell, but horizontal and vertical cell strides
+ * can differ, so this is measured empirically off the head's own keyframes
+ * rather than assumed to be a single constant.
+ */
+function maxConsecutiveDistance(positions: readonly Point[]): number {
+  let max = 0;
+  for (let i = 1; i < positions.length; i += 1) {
+    max = Math.max(max, distanceBetween(positions[i - 1]!, positions[i]!));
+  }
+  return max;
+}
+
+/**
+ * Caps each frame-to-frame movement in `positions` to at most `maxDistancePx`
+ * (moving as far as allowed toward the original position, rather than
+ * discarding the frame entirely), so a sequence built from time-shifted
+ * samples (see `laggedPositions`) can never move faster than the head's own
+ * worst single hop even when the *ideal* time-shifted position would require
+ * covering many hops within a single frame (e.g. a long jump immediately
+ * followed by a very short step -- the exact shape QA's repro exercises).
+ * Any distance this trims off is made up as fast as the speed cap allows on
+ * subsequent frames, since the ideal target keeps advancing independently of
+ * how far behind the clamped trail currently sits.
+ *
+ * ## Design decision: bounded-speed "chase" motion, not exact-boundary alignment
+ *
+ * A hard speed cap and "body segment k sits exactly on the cell the head
+ * occupied k steps ago, at *every* step boundary" are mathematically
+ * incompatible whenever a long jump is immediately followed by an
+ * arbitrarily short step: the short step's real-time budget can be smaller
+ * than what covering the jump-sized gap at the head's own top speed would
+ * require, so there is provably not enough time to be both exactly-on-target
+ * and speed-capped at that boundary. QA proved this isn't a rare edge case --
+ * a minimal 3-step repro (a 10-hop jump followed by a 1-hop step, bodyLength
+ * 1) lands segment 0 up to 126px (9 grid cells) away from the "exact
+ * k-steps-ago" position, and sampling that same invariant across a realistic
+ * 53x7/296-step fixture found mismatches at 169/430 (39%) of sampled step
+ * boundaries across lags 1-10. A repeating long-jump/short-step pattern with
+ * no recovery slack between cycles was also shown to *not* self-correct: the
+ * same offset recurs identically cycle over cycle.
+ *
+ * The project owner's call, given that tension: relax the exact-boundary
+ * requirement and render body segments as bounded-speed "chase" motion
+ * instead -- the same organic, never-snapping trailing-segment look common
+ * to follow-the-leader "snake" animations, rather than teleporting or
+ * rigid-exact alignment. This only affects how body segments are *drawn*;
+ * `solveSnakePath.ts`'s grid-based occupancy/self-collision model is exact in
+ * its own abstract coordinate space and is untouched by this trade-off.
+ *
+ * What IS guaranteed instead (see the corresponding tests in
+ * renderSnake.test.ts):
+ *   1. Speed bound: no segment/connector endpoint ever exceeds the head's
+ *      own fastest observed px/ms (this function).
+ *   2. No NaN/undefined/backwards-time positions, ever -- including before a
+ *      segment has enough history for a real lagged target yet (see
+ *      `headPositionAtTime`'s clamping).
+ *   3. Convergence under slack: whenever a segment falls behind and the
+ *      steps that follow don't immediately demand another hard catch-up, the
+ *      gap to its ideal (unclamped) time-shifted target shrinks frame over
+ *      frame until it's fully resynced.
+ *   4. Bounded worst case: even under a pathological repeating hard
+ *      jump/short-step pattern with *no* recovery slack at all, the
+ *      steady-state error stays bounded rather than growing cycle over
+ *      cycle -- it settles into a stable offset, not a divergence.
+ * What is explicitly NOT guaranteed: exact pixel/cell alignment at every
+ * single step boundary under adversarial (mismatched-hop-count) adjacent
+ * steps.
+ */
+function clampToMaxSpeed(positions: readonly Point[], maxDistancePx: number): Point[] {
+  if (positions.length === 0) return [];
+  const result: Point[] = [positions[0]!];
+  for (let i = 1; i < positions.length; i += 1) {
+    const previous = result[i - 1]!;
+    const ideal = positions[i]!;
+    const distance = distanceBetween(previous, ideal);
+    if (distance <= maxDistancePx) {
+      result.push(ideal);
+    } else {
+      const scale = maxDistancePx / distance;
+      result.push({
+        x: previous.x + (ideal.x - previous.x) * scale,
+        y: previous.y + (ideal.y - previous.y) * scale,
+      });
+    }
+  }
+  return result;
+}
+
+/**
  * Renders the animated snake: a head (Command, with a rotating direction
  * arrow) trailed by `bodyLength` body nodes (message-bus segments), connected
  * by dashed connector lines. Movement between contributed cells is tweened
  * smoothly (see visual-design.md 2.3) rather than following grid lines, which
  * is why every node's position is driven by a single SMIL `translate`
- * animation interpolating directly between cell centers.
+ * animation interpolating through each step's waypoint route rather than
+ * jumping directly between cell centers.
  */
 export function renderSnake(steps: readonly SnakePathStep[], bodyLength: number): string {
   if (steps.length === 0) return "";
 
   const { stepDurationMs, loopResetPauseMs } = ANIMATION_TIMING;
-  const { keyTimes, totalDurationMs } = buildLoopTimeline(steps.length, stepDurationMs, loopResetPauseMs);
+  const stepDurationsMs = computeStepDurationsMs(steps, stepDurationMs);
+  const { absoluteTimesMs, totalDurationMs } = buildLoopTimeline(stepDurationsMs, loopResetPauseMs);
 
-  const headPositions = steps.map((step) => cellCenter(step.cell));
+  const hopFrames = buildHopFrames(steps, absoluteTimesMs, stepDurationMs);
+  const keyTimes = [...hopFrames.map((frame) => frame.timeMs), totalDurationMs].map((t) => t / totalDurationMs);
+  keyTimes[keyTimes.length - 1] = 1; // guard against floating point drift
+
+  const headPositions = hopFrames.map((frame) => waypointPosition(steps, frame.stepIndex, frame.hopIndex));
   const extendedHeadPositions = [...headPositions, headPositions.at(-1)!];
 
   const rawAngles = headPositions.map((position, index) => {
@@ -85,9 +293,42 @@ export function renderSnake(steps: readonly SnakePathStep[], bodyLength: number)
   const headAngles = unwrapAngles(rawAngles);
   const extendedHeadAngles = [...headAngles, headAngles.at(-1) ?? 0];
 
-  /** Position sequence of the body segment trailing `lag` steps behind the head. */
-  function laggedPositions(lag: number): Point[] {
-    return extendedHeadPositions.map((_, index) => extendedHeadPositions[Math.max(0, index - lag)]!);
+  // The head's own continuous keyframe timeline: every hop frame's absolute
+  // time paired with the head's position at that instant, plus the trailing
+  // hold-frame time/position so time-shift lookups never fall outside the
+  // range covered by `headPositionAtTime`.
+  const headTimelineTimesMs = [...hopFrames.map((frame) => frame.timeMs), totalDurationMs];
+  const maxHeadHopDistancePx = maxConsecutiveDistance(headPositions);
+
+  /**
+   * Position sequence of the body segment trailing `stepLag` *steps* (not
+   * hops) behind the head -- matching solveSnakePath's actual body-occupancy
+   * model, where each segment sits on a previously-*eaten* cell rather than a
+   * mid-route waypoint. Rather than replaying the shifted step's own
+   * waypoints at the current step's fractional hop-progress (the old
+   * approach, which desyncs badly whenever the shifted and current steps
+   * have very different hop counts -- see project report, "the snake body
+   * snaps/teleports"), this reads the segment's position directly off the
+   * head's own trajectory at (this frame's time minus the real duration of
+   * the `stepLag` most recent steps). That makes the *ideal* target an exact,
+   * undistorted echo of however the head actually moved, just shifted later
+   * in time -- but the position actually rendered is `clampToMaxSpeed`'s
+   * output, not that ideal target directly. `clampToMaxSpeed` caps the
+   * segment's per-frame travel whenever the ideal time-shifted target would
+   * itself require covering more ground than the head's worst single hop
+   * within one frame (e.g. a long jump immediately followed by a very short
+   * step -- not a rare case; see the design-decision note on
+   * `clampToMaxSpeed` for how often this actually happens and exactly what is
+   * and isn't guaranteed as a result).
+   */
+  function laggedPositions(stepLag: number): Point[] {
+    const idealPositions = hopFrames.map((frame) => {
+      const lagMs = lagDurationMs(absoluteTimesMs, frame.stepIndex, stepLag);
+      const targetTimeMs = frame.timeMs - lagMs;
+      return headPositionAtTime(headTimelineTimesMs, extendedHeadPositions, targetTimeMs);
+    });
+    const clamped = clampToMaxSpeed(idealPositions, maxHeadHopDistancePx);
+    return [...clamped, clamped.at(-1)!];
   }
 
   const headGroup = `

@@ -80,7 +80,7 @@ async function main(): Promise<void> {
   const svg = renderSvgDocument(
     width,
     height,
-    renderGrid(grid),
+    renderGrid(grid, solution.steps),
     renderEventBubble(grid, solution.steps, solution.bodyLength),
     renderSnake(solution.steps, solution.bodyLength),
   );
