@@ -1,0 +1,74 @@
+name: Generate Wolverine snake
+
+on:
+  schedule:
+    # Daily at 00:00 UTC. GitHub's contribution calendar only changes once a
+    # day, so running more often than that has no effect (tech-stack.md §5).
+    - cron: "0 0 * * *"
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Generate snake SVG
+        env:
+          # The default GITHUB_TOKEN cannot read a user's contribution
+          # calendar (that's user-scoped data, not repo-scoped). Add a
+          # classic Personal Access Token with the `read:user` scope as a
+          # repository secret named GH_PAT (Settings > Secrets and
+          # variables > Actions).
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        run: node dist/index.js --username "${{ github.repository_owner }}" --output dist/wolverine-snake.svg
+
+      - name: Publish to the output branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mkdir -p /tmp/wolverine-snake-output
+          cp dist/wolverine-snake.svg /tmp/wolverine-snake-output/wolverine-snake.svg
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin output || true
+          if git show-ref --verify --quiet refs/remotes/origin/output; then
+            git checkout -B output origin/output
+          else
+            git checkout --orphan output
+            git rm -rf . > /dev/null 2>&1 || true
+          fi
+
+          mkdir -p dist
+          cp /tmp/wolverine-snake-output/wolverine-snake.svg dist/wolverine-snake.svg
+
+          git add dist/wolverine-snake.svg
+          if git diff --cached --quiet; then
+            echo "No changes to publish."
+          else
+            git commit -m "chore: update wolverine snake SVG"
+            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" output
+          fi
