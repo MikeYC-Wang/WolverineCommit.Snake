@@ -50,7 +50,17 @@ function buildFillKeyframes(
     keyTimes.push(fraction);
     values.push(rawValues[i]!);
   }
-  if (keyTimes.at(-1)! < 1) {
+  // Guarantee the loop always ends back on `originalColor`, even if the
+  // fade-in and fade-out windows are close enough together (relative to
+  // `totalDurationMs`) that `fadeToOriginalStartMs`'s keyframe above got
+  // deduped away for landing at the same fraction as `fadeToEatenEndMs`.
+  // Without this, whichever raw keyframe happens to claim fraction 1 wins,
+  // which could leave the cell stuck on `eatenColor` at the loop seam (a
+  // visible "pop" back to `originalColor` at the start of the next loop
+  // instead of a smooth revert).
+  if (keyTimes.at(-1)! === 1) {
+    values[values.length - 1] = originalColor;
+  } else {
     keyTimes.push(1);
     values.push(originalColor);
   }
