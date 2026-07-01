@@ -307,3 +307,61 @@ describe("solveSnakePath - dead-end fallback", () => {
     expect(result.steps.filter((s) => s.ateContribution).length).toBe(result.totalContributedCells);
   });
 });
+
+describe("solveSnakePath - coverage reporting (isFullyCovered / eatenContributionCount)", () => {
+  function buildDensityGrid(weekCount: number, dayCount: number, densityFn: (w: number, d: number) => boolean) {
+    const rows: string[] = [];
+    for (let d = 0; d < dayCount; d += 1) {
+      let row = "";
+      for (let w = 0; w < weekCount; w += 1) row += densityFn(w, d) ? "#" : ".";
+      rows.push(row);
+    }
+    return buildGrid(rows);
+  }
+
+  it("reports full coverage for a normally-solvable board", () => {
+    const grid = buildGrid(["#####", "#####", "#####"]);
+    const result = solveSnakePath(grid, { bodyLength: 4 });
+    expect(result.isFullyCovered).toBe(true);
+    expect(result.eatenContributionCount).toBe(result.totalContributedCells);
+  });
+
+  it("reports full coverage (trivially) for a grid with no contributions", () => {
+    const grid = buildGrid(["....."]);
+    const result = solveSnakePath(grid);
+    expect(result.isFullyCovered).toBe(true);
+    expect(result.eatenContributionCount).toBe(0);
+  });
+
+  it("KNOWN LIMITATION: flags isFullyCovered=false (instead of throwing or silently under-reporting) " +
+    "when the dead-end fallback's isSafeMove heuristic fails to prevent a trap", () => {
+    // Independently discovered during QA review (not one of the two density
+    // patterns already covered by the regression tests above): a 53x7 board
+    // at ~80% density where the snake sweeps almost the whole board but gets
+    // boxed into the last column/corner, leaving 1 of 296 cells uneaten.
+    // This demonstrates isSafeMove is a heuristic, not a proof: full 2D
+    // coverage on dense real-world-shaped boards is NOT guaranteed by this
+    // algorithm. Do not "fix" this test by tweaking the heuristic without a
+    // principled redesign (see solveSnakePath.ts isSafeMove doc comment) --
+    // its purpose here is to make the residual risk visible and regression-
+    // tested, not to assert 100% coverage is achieved.
+    const grid = buildDensityGrid(53, 7, (w, d) => (w * 3 + d * 7) % 5 !== 0);
+    const result = solveSnakePath(grid, { bodyLength: 10 });
+
+    expect(result.eatenContributionCount).toBeLessThan(result.totalContributedCells);
+    expect(result.isFullyCovered).toBe(false);
+    // Coverage reporting must stay internally consistent even when incomplete.
+    expect(result.steps.filter((s) => s.ateContribution).length).toBe(result.eatenContributionCount);
+    expect(result.steps.at(-1)?.isLoopComplete).toBe(false);
+  });
+
+  it("KNOWN LIMITATION: the documented 1D-corridor trap is also reported via isFullyCovered", () => {
+    const grid = buildGrid(["#####.##"]);
+    const result = solveSnakePath(grid, {
+      bodyLength: 4,
+      startCell: { weekIndex: 3, dayIndex: 0 },
+    });
+    expect(result.isFullyCovered).toBe(false);
+    expect(result.eatenContributionCount).toBe(4);
+  });
+});

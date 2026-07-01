@@ -54,6 +54,23 @@ export interface SolveSnakePathResult {
   readonly startCell: GridCell;
   readonly bodyLength: number;
   readonly totalContributedCells: number;
+  /** Count of distinct contributed cells actually eaten across `steps`. */
+  readonly eatenContributionCount: number;
+  /**
+   * True iff every contributed cell in the grid was eaten (i.e. the loop ran
+   * to full completion). The dead-end fallback's `isSafeMove` heuristic
+   * (see below) is an empirically-tuned approximation, not a proof of
+   * completeness: on some board shapes -- typically very dense grids where
+   * the fixed-length body can wall off a small pocket near an edge/corner --
+   * the snake can still become irrecoverably boxed in before eating
+   * everything. When that happens this flag is `false` and the loop stops
+   * early (no throw, so CI doesn't fail), but callers MUST check this flag
+   * rather than assuming `steps` always covers every contribution: silently
+   * ignoring it means some of the user's contributions never show up in the
+   * animation. See solveSnakePath.test.ts "known limitation" cases for
+   * concrete repros.
+   */
+  readonly isFullyCovered: boolean;
 }
 
 function neighborsOf(cell: GridCell, grid: ContributionGrid): GridCell[] {
@@ -410,6 +427,8 @@ export function solveSnakePath(
       startCell: fallbackStart,
       bodyLength,
       totalContributedCells: 0,
+      eatenContributionCount: 0,
+      isFullyCovered: true,
     };
   }
 
@@ -431,12 +450,15 @@ export function solveSnakePath(
   const plannedTour = tourLength(optimizedTour) <= tourLength(greedyTour) ? optimizedTour : greedyTour;
 
   const steps = simulateTour(grid, plannedTour, bodyLength);
+  const eatenContributionCount = steps.reduce((count, step) => count + (step.ateContribution ? 1 : 0), 0);
 
   return {
     steps,
     startCell,
     bodyLength,
     totalContributedCells: contributedCells.length,
+    eatenContributionCount,
+    isFullyCovered: eatenContributionCount === contributedCells.length,
   };
 }
 

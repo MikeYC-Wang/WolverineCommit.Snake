@@ -89,8 +89,26 @@ async function main(): Promise<void> {
   await writeFile(args.output, svg, "utf8");
 
   console.log(
-    `Wrote ${args.output} (${solution.totalContributedCells} contributed cells, ${solution.steps.length} steps).`,
+    `Wrote ${args.output} (${solution.eatenContributionCount}/${solution.totalContributedCells} ` +
+      `contributed cells eaten, ${solution.steps.length} steps).`,
   );
+
+  if (!solution.isFullyCovered) {
+    const missed = solution.totalContributedCells - solution.eatenContributionCount;
+    // The dead-end fallback's safety heuristic is empirically tuned, not
+    // proven (see solveSnakePath.ts); on some board shapes the snake can
+    // still box itself in before eating every contributed cell. Fail loudly
+    // here rather than silently shipping an animation that quietly omits
+    // some of the user's contributions.
+    console.warn(
+      `WARNING: solveSnakePath did not achieve full coverage: ${missed} of ` +
+        `${solution.totalContributedCells} contributed cell(s) were never eaten ` +
+        "(the snake became boxed in). The generated SVG is still usable but " +
+        "understates this user's contributions. See docs/tech-stack.md section 3 " +
+        "(\"risk and unverified items\") and solveSnakePath.test.ts's " +
+        "\"known limitation\" cases.",
+    );
+  }
 }
 
 main().catch((error: unknown) => {
