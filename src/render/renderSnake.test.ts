@@ -3,6 +3,7 @@ import { solveSnakePath, type SnakePathStep } from "../pathfinding/solveSnakePat
 import type { ContributionDay, ContributionGrid } from "../types.js";
 import { cellCenter } from "./layout.js";
 import { ANIMATION_TIMING, SNAKE_BODY_FILL, SNAKE_HEAD_BORDER, SNAKE_HEAD_FILL } from "./theme.js";
+import { buildLoopTimeline, computeStepDurationsMs } from "./timeline.js";
 import { renderSnake } from "./renderSnake.js";
 
 interface Point {
@@ -157,26 +158,101 @@ function stepBoundaryFrameIndices(steps: readonly SnakePathStep[]): number[] {
 }
 
 /**
- * Gap (px), at every step boundary, between a lagged body segment's actual
- * (post-`clampToMaxSpeed`) rendered position and its *ideal* (unclamped)
- * time-shifted target. At step boundary `s`, the ideal target for a segment
- * lagging `stepLag` steps behind the head is exactly the head's own actual
- * position at step boundary `s - stepLag` (or the start position, if that
- * would be before the loop began) -- see `headPositionAtTime`/
- * `laggedPositions` in renderSnake.ts, and the design-decision comment on
- * `clampToMaxSpeed` for why this gap is not always zero.
+ * Gap, at every step boundary, between a lagged body segment's actual
+ * (post-`clampArcLengthToMaxSpeed`) rendered position and its *ideal*
+ * (unclamped) time-shifted target -- both expressed as *arc-length* (px
+ * traveled along the head's own path), not raw (x,y) Euclidean distance.
+ *
+ * Arc-length is the correct unit for this gap under the arc-length
+ * reparameterization fix: the whole point of that fix is that a segment
+ * "catching up" always walks the head's actual route rather than cutting a
+ * Euclidean shortcut across it, so a segment sitting exactly on the path but
+ * a corner's-worth "behind" the ideal target can easily have a *larger* raw
+ * (x,y) distance to that target than a segment that's Euclidean-closer but
+ * off-path -- that isn't a regression, it's the fix working. Measuring the
+ * gap along the path instead makes "shrinking" mean what it should: less
+ * ground left to walk, monotonically, regardless of how many corners that
+ * ground has.
+ *
+ * At step boundary `s`, the ideal target for a segment lagging `stepLag`
+ * steps behind the head is exactly the head's own actual arc-length position
+ * at step boundary `s - stepLag` (or the start position, if that would be
+ * before the loop began) -- see `headArcLengthAtTime`/`laggedPositions` in
+ * renderSnake.ts, and the design-decision comment on
+ * `clampArcLengthToMaxSpeed` for why this gap is not always zero.
  */
 function gapsAtStepBoundaries(steps: readonly SnakePathStep[], svg: string, stepLag: number): number[] {
   const boundaryFrame = stepBoundaryFrameIndices(steps);
   const headPositions = parseNodePositions(svg, "wolverine-snake-head");
+  const headArcLengths = buildCumulativeArcLengthLocal(headPositions);
   const bodyPositions = parseNodePositions(svg, `wolverine-snake-body-${stepLag - 1}`);
-  const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);
   return steps.map((_, stepIndex) => {
     const idealSourceStep = Math.max(stepIndex - stepLag, 0);
-    const ideal = headPositions[boundaryFrame[idealSourceStep]!]!;
-    const actual = bodyPositions[boundaryFrame[stepIndex]!]!;
-    return distance(ideal, actual);
+    const idealArcLength = headArcLengths[boundaryFrame[idealSourceStep]!]!;
+    const actualPoint = bodyPositions[boundaryFrame[stepIndex]!]!;
+    const actualArcLength = arcLengthOfOnPathPoint(actualPoint, headPositions, headArcLengths);
+    return idealArcLength - actualArcLength;
   });
+}
+
+/**
+ * Whether point `p` lies on the closed segment `[a, b]` (within `tolerance`
+ * px of perpendicular distance from the infinite line, and within the
+ * segment's own extent -- not just anywhere on the line through it).
+ */
+function isOnSegment(p: Point, a: Point, b: Point, tolerance = 1e-6): boolean {
+  const abx = b.x - a.x;
+  const aby = b.y - a.y;
+  const segLengthSq = abx * abx + aby * aby;
+  if (segLengthSq === 0) return Math.hypot(p.x - a.x, p.y - a.y) <= tolerance;
+
+  const cross = abx * (p.y - a.y) - aby * (p.x - a.x);
+  const segLength = Math.sqrt(segLengthSq);
+  if (Math.abs(cross) / segLength > tolerance) return false;
+
+  const t = ((p.x - a.x) * abx + (p.y - a.y) * aby) / segLengthSq;
+  return t >= -1e-9 && t <= 1 + 1e-9;
+}
+
+/**
+ * Whether `p` lies exactly on *some* consecutive segment of the head's own
+ * traveled polyline (`headPositions`) -- the core "never cuts across the
+ * grid" guarantee the arc-length reparameterization fix exists to provide.
+ */
+function isOnHeadPolyline(p: Point, headPositions: readonly Point[], tolerance = 1e-6): boolean {
+  for (let i = 1; i < headPositions.length; i += 1) {
+    if (isOnSegment(p, headPositions[i - 1]!, headPositions[i]!, tolerance)) return true;
+  }
+  return false;
+}
+
+/** Mirrors `buildCumulativeArcLength` (renderSnake.ts) for use in tests, from parsed (x,y) positions. */
+function buildCumulativeArcLengthLocal(positions: readonly Point[]): number[] {
+  const arcLengths: number[] = [0];
+  for (let i = 1; i < positions.length; i += 1) {
+    arcLengths.push(arcLengths[i - 1]! + Math.hypot(positions[i]!.x - positions[i - 1]!.x, positions[i]!.y - positions[i - 1]!.y));
+  }
+  return arcLengths;
+}
+
+/**
+ * Arc-length coordinate (px traveled along the head's own polyline) of a
+ * point already known to lie exactly on it (e.g. any rendered body-segment
+ * position, given the on-path guarantee under test elsewhere in this file).
+ * Finds the polyline segment `p` lies on and linearly interpolates between
+ * that segment's own cumulative arc-length endpoints.
+ */
+function arcLengthOfOnPathPoint(p: Point, headPositions: readonly Point[], cumulativeArcLength: readonly number[]): number {
+  for (let i = 1; i < headPositions.length; i += 1) {
+    const a = headPositions[i - 1]!;
+    const b = headPositions[i]!;
+    if (!isOnSegment(p, a, b)) continue;
+    const segLen = cumulativeArcLength[i]! - cumulativeArcLength[i - 1]!;
+    if (segLen === 0) return cumulativeArcLength[i - 1]!;
+    const t = Math.hypot(p.x - a.x, p.y - a.y) / segLen;
+    return cumulativeArcLength[i - 1]! + t * segLen;
+  }
+  throw new Error("point is not on the head's own traveled polyline");
 }
 
 function totalDurationOf(svg: string): number {
@@ -354,6 +430,180 @@ describe("renderSnake", () => {
     });
   });
 
+  describe("body/connector positions stay exactly on the head's own traveled path (arc-length reparameterization)", () => {
+    it("keeps every body-segment and connector-endpoint position exactly on the head's polyline, even under heavy clamping", () => {
+      const bodyLength = 3;
+      const svg = renderSnake(longJumpThenShortStepSteps, bodyLength);
+      const headPositions = parseNodePositions(svg, "wolverine-snake-head");
+
+      let checked = 0;
+      for (let segment = 0; segment < bodyLength; segment += 1) {
+        const positions = parseNodePositions(svg, `wolverine-snake-body-${segment}`);
+        for (const p of positions) {
+          expect(isOnHeadPolyline(p, headPositions)).toBe(true);
+          checked += 1;
+        }
+      }
+      for (let i = 0; i < bodyLength; i += 1) {
+        const { from, to } = parseConnectorEndpoints(svg, i);
+        for (const p of [...from, ...to]) {
+          expect(isOnHeadPolyline(p, headPositions)).toBe(true);
+          checked += 1;
+        }
+      }
+      expect(checked).toBeGreaterThan(20); // sanity: this actually exercised many frames, not a vacuous pass
+    });
+
+    it("also holds at the realistic dense-fixture scale (mixed jump lengths, ~300 steps)", () => {
+      const grid = buildDensityGrid(53, 7, (w, d) => (w * 3 + d * 7) % 5 !== 0);
+      const { steps, bodyLength } = solveSnakePath(grid);
+      const svg = renderSnake(steps, bodyLength);
+      const headPositions = parseNodePositions(svg, "wolverine-snake-head");
+
+      for (let segment = 0; segment < bodyLength; segment += 1) {
+        const positions = parseNodePositions(svg, `wolverine-snake-body-${segment}`);
+        for (const p of positions) {
+          expect(isOnHeadPolyline(p, headPositions)).toBe(true);
+        }
+      }
+    });
+
+    it("proves the on-path test above is meaningful: the pre-fix Euclidean clampToMaxSpeed produced off-path points on this exact fixture", () => {
+      // Reconstructs the head's own keyframe timeline (buildHopFrames /
+      // waypointPosition / lagDurationMs are all unchanged by this fix, just
+      // not exported, so they're reproduced here) and then re-applies the
+      // *pre-fix* clamp -- a straight Euclidean line from the segment's
+      // previous rendered (x,y) toward the ideal (x,y) target -- to show it
+      // lands off the head's polyline on this exact adversarial fixture.
+      const steps = longJumpThenShortStepSteps;
+      const { stepDurationMs, loopResetPauseMs } = ANIMATION_TIMING;
+      const stepDurationsMs = computeStepDurationsMs(steps, stepDurationMs);
+      const { absoluteTimesMs, totalDurationMs } = buildLoopTimeline(stepDurationsMs, loopResetPauseMs);
+
+      interface HopFrame {
+        timeMs: number;
+        stepIndex: number;
+        hopIndex: number;
+      }
+      const hopFrames: HopFrame[] = [{ timeMs: 0, stepIndex: 0, hopIndex: 0 }];
+      for (let stepIndex = 1; stepIndex < steps.length; stepIndex += 1) {
+        const s = steps[stepIndex]!;
+        const hopCount = Math.max(1, s.waypoints.length - 1);
+        const stepStartMs = absoluteTimesMs[stepIndex - 1]!;
+        for (let hopIndex = 1; hopIndex <= hopCount; hopIndex += 1) {
+          hopFrames.push({ timeMs: stepStartMs + hopIndex * stepDurationMs, stepIndex, hopIndex });
+        }
+      }
+      const waypointPositionLocal = (stepIndex: number, hopIndex: number): Point => {
+        const s = steps[stepIndex]!;
+        const waypointIndex = Math.min(hopIndex, s.waypoints.length - 1);
+        return cellCenter(s.waypoints[waypointIndex]!);
+      };
+      const headPositions = hopFrames.map((f) => waypointPositionLocal(f.stepIndex, f.hopIndex));
+      const extendedHeadPositions = [...headPositions, headPositions.at(-1)!];
+      const headTimelineTimesMs = [...hopFrames.map((f) => f.timeMs), totalDurationMs];
+
+      const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);
+      let maxHeadHopDistancePx = 0;
+      for (let i = 1; i < headPositions.length; i += 1) {
+        maxHeadHopDistancePx = Math.max(maxHeadHopDistancePx, distance(headPositions[i - 1]!, headPositions[i]!));
+      }
+
+      // Pre-fix `lagDurationMs` (renderSnake.ts) -- untouched by this fix.
+      const lagDurationMsLocal = (stepIndex: number, stepLag: number, frameTimeMs: number): number => {
+        const startIndex = stepIndex - stepLag;
+        if (startIndex >= 0) {
+          const endMs = absoluteTimesMs[stepIndex] ?? 0;
+          return endMs - absoluteTimesMs[startIndex]!;
+        }
+        const growthProgress = stepLag > 0 ? stepIndex / stepLag : 1;
+        return frameTimeMs * growthProgress;
+      };
+
+      // Pre-fix `headPositionAtTime` (renderSnake.ts): binary-search + lerp
+      // directly in (x,y) space.
+      const legacyHeadPositionAtTime = (timeMs: number): Point => {
+        const times = headTimelineTimesMs;
+        const positions = extendedHeadPositions;
+        const lastIndex = times.length - 1;
+        const clampedTime = Math.min(Math.max(timeMs, times[0]!), times[lastIndex]!);
+        let low = 0;
+        let high = lastIndex;
+        while (low < high) {
+          const mid = (low + high) >> 1;
+          if (times[mid]! < clampedTime) low = mid + 1;
+          else high = mid;
+        }
+        if (low === 0 || times[low] === clampedTime) return positions[low]!;
+        const beforeTime = times[low - 1]!;
+        const afterTime = times[low]!;
+        const before = positions[low - 1]!;
+        const after = positions[low]!;
+        const span = afterTime - beforeTime;
+        const progress = span > 0 ? (clampedTime - beforeTime) / span : 0;
+        return { x: before.x + (after.x - before.x) * progress, y: before.y + (after.y - before.y) * progress };
+      };
+
+      // Pre-fix `clampToMaxSpeed` (renderSnake.ts, before this fix) -- the
+      // actual bug: moves in a straight Euclidean line toward the ideal
+      // (x,y) target, with no awareness of the grid the head's route
+      // actually followed.
+      const legacyClampToMaxSpeed = (positions: readonly Point[], maxDistancePx: number): Point[] => {
+        if (positions.length === 0) return [];
+        const result: Point[] = [positions[0]!];
+        for (let i = 1; i < positions.length; i += 1) {
+          const previous = result[i - 1]!;
+          const ideal = positions[i]!;
+          const d = distance(previous, ideal);
+          if (d <= maxDistancePx) {
+            result.push(ideal);
+          } else {
+            const scale = maxDistancePx / d;
+            result.push({ x: previous.x + (ideal.x - previous.x) * scale, y: previous.y + (ideal.y - previous.y) * scale });
+          }
+        }
+        return result;
+      };
+
+      const stepLag = 1;
+      const idealPositions = hopFrames.map((frame) => {
+        const lagMs = lagDurationMsLocal(frame.stepIndex, stepLag, frame.timeMs);
+        return legacyHeadPositionAtTime(frame.timeMs - lagMs);
+      });
+      const legacyPositions = legacyClampToMaxSpeed(idealPositions, maxHeadHopDistancePx);
+
+      const offPathPositions = legacyPositions.filter((p) => !isOnHeadPolyline(p, extendedHeadPositions));
+      const worstOffset = offPathPositions.length > 0
+        ? Math.max(
+            ...offPathPositions.map((p) =>
+              Math.min(
+                ...extendedHeadPositions
+                  .slice(1)
+                  .map((_, i) => {
+                    const a = extendedHeadPositions[i]!;
+                    const b = extendedHeadPositions[i + 1]!;
+                    const abx = b.x - a.x;
+                    const aby = b.y - a.y;
+                    const segLenSq = abx * abx + aby * aby;
+                    if (segLenSq === 0) return distance(p, a);
+                    const t = Math.min(1, Math.max(0, ((p.x - a.x) * abx + (p.y - a.y) * aby) / segLenSq));
+                    return distance(p, { x: a.x + abx * t, y: a.y + aby * t });
+                  }),
+              ),
+            ),
+          )
+        : 0;
+
+      // The pre-fix Euclidean clamp really did cut across the grid on this
+      // exact fixture: at least one rendered frame lands measurably off the
+      // head's own polyline, confirming the new on-path test above is a
+      // meaningful regression guard against the reported bug, not a
+      // tautology that would pass against any implementation.
+      expect(offPathPositions.length).toBeGreaterThan(0);
+      expect(worstOffset).toBeGreaterThan(1);
+    });
+  });
+
   describe("realistic dense fixture (QA's 53x7 repro scale)", () => {
     it("holds the no-segment-faster-than-head property at full scale with mixed jump lengths", () => {
       // Same shape QA used to find the bug: a large, densely (but not fully)
@@ -414,7 +664,15 @@ describe("renderSnake", () => {
         ]), // 10-hop jump
         jumpStep([[10, 0], [10, 1]]), // 1-hop step immediately after -- this is the hard transition where the clamp engages
         // Recovery slack: ordinary 1-hop steps that don't demand another hard
-        // catch-up, giving the clamped segment room to close the gap.
+        // catch-up, giving the clamped segment room to close the gap. This
+        // needs a few more steps than an equivalent Euclidean-space version
+        // of this test would: catching up now means actually walking the
+        // head's bent route (including the corner at week 10 -> week 9,
+        // where the path turns from the day axis back onto the week axis),
+        // which covers strictly more ground than the old Euclidean shortcut
+        // "as the crow flies" toward the same eventual target -- so full
+        // resync legitimately costs more steps' worth of speed-capped travel
+        // than it used to.
         jumpStep([[10, 1], [10, 2]]),
         jumpStep([[10, 2], [10, 3]]),
         jumpStep([[10, 3], [10, 4]]),
@@ -422,6 +680,9 @@ describe("renderSnake", () => {
         jumpStep([[10, 5], [10, 6]]),
         jumpStep([[9, 6], [8, 6]]),
         jumpStep([[8, 6], [7, 6]]),
+        jumpStep([[7, 6], [6, 6]]),
+        jumpStep([[6, 6], [5, 6]]),
+        jumpStep([[5, 6], [4, 6]]),
       ];
       const svg = renderSnake(steps, 1);
       const gaps = gapsAtStepBoundaries(steps, svg, 1);
