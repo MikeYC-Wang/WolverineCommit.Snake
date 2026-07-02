@@ -365,3 +365,108 @@ describe("solveSnakePath - coverage reporting (isFullyCovered / eatenContributio
     expect(result.eatenContributionCount).toBe(4);
   });
 });
+
+describe("solveSnakePath - opportunistic eating (crediting un-eaten cells a route merely passes over)", () => {
+  // This exact 8x6 layout at bodyLength 3 was found by exploring small dense
+  // boards for one where a BFS route to the tour's planned target legitimately
+  // crosses another still-uneaten contribution cell -- the scenario reported
+  // by the project owner (some visually-passed-over cells never faded). It's
+  // fully deterministic (no randomness anywhere in the algorithm), so the
+  // exact split below is a stable, hand-verified regression fixture rather
+  // than a fragile snapshot of incidental behavior.
+  const opportunisticGrid = buildGrid([
+    ".####.##",
+    "##.####.",
+    "####.###",
+    "#.####.#",
+    "###.####",
+    ".####.##",
+  ]);
+
+  it("splits a route into a separate step for an intermediate cell it opportunistically eats", () => {
+    const result = solveSnakePath(opportunisticGrid, { bodyLength: 3 });
+
+    // (5,2) sits on the BFS route the algorithm takes toward its actual
+    // planned target (5,3); (5,2) itself hadn't been targeted yet, so it must
+    // be credited via its own opportunistic step, not silently skipped.
+    const bridgeStepIndex = result.steps.findIndex(
+      (s) => s.cell.weekIndex === 5 && s.cell.dayIndex === 2,
+    );
+    const targetStepIndex = result.steps.findIndex(
+      (s) => s.cell.weekIndex === 5 && s.cell.dayIndex === 3,
+    );
+
+    expect(bridgeStepIndex).toBeGreaterThan(-1);
+    expect(targetStepIndex).toBeGreaterThan(-1);
+    // The opportunistically-eaten cell must be its own, earlier step -- not
+    // merged into one big jump that only stops at the final target.
+    expect(bridgeStepIndex).toBeLessThan(targetStepIndex);
+
+    const bridgeStep = result.steps[bridgeStepIndex]!;
+    const targetStep = result.steps[targetStepIndex]!;
+
+    // (a) both show up as their own `ateContribution: true` steps.
+    expect(bridgeStep.ateContribution).toBe(true);
+    expect(targetStep.ateContribution).toBe(true);
+    // The split sub-route for the opportunistic cell ends exactly there...
+    expect(bridgeStep.waypoints.at(-1)).toEqual({ weekIndex: 5, dayIndex: 2 });
+    // ...and the very next step's waypoints continue from that exact cell,
+    // rather than jumping straight from the pre-route head to the target.
+    expect(targetStep.waypoints[0]).toEqual({ weekIndex: 5, dayIndex: 2 });
+    expect(targetStep.waypoints.at(-1)).toEqual({ weekIndex: 5, dayIndex: 3 });
+
+    // (b) full coverage: every contributed cell -- including the
+    // opportunistically-eaten one -- ends up eaten.
+    expect(result.eatenContributionCount).toBe(result.totalContributedCells);
+    expect(result.isFullyCovered).toBe(true);
+
+    // (c) the route wasn't collapsed into one big jump: splitting it added a
+    // genuinely separate step rather than folding the bridge cell's credit
+    // into the target step.
+    expect(targetStepIndex).toBe(bridgeStepIndex + 1);
+  });
+
+  it("never emits a duplicate ateContribution:true step for the same cell", () => {
+    const result = solveSnakePath(opportunisticGrid, { bodyLength: 3 });
+    const eatenKeys = result.steps.filter((s) => s.ateContribution).map((s) => cellKey(s.cell));
+    expect(new Set(eatenKeys).size).toBe(eatenKeys.length);
+  });
+
+  it("keeps the step sequence contiguous across a split (no gaps for the renderer to trip on)", () => {
+    const result = solveSnakePath(opportunisticGrid, { bodyLength: 3 });
+    for (let i = 0; i < result.steps.length; i += 1) {
+      const step = result.steps[i]!;
+      const previousCell = i === 0 ? result.startCell : result.steps[i - 1]!.cell;
+      expect(step.waypoints[0]).toEqual(previousCell);
+    }
+  });
+
+  it("realistic scale: every contributed cell ends up eaten on a dense/sparse-mixed 53x7 board", () => {
+    // Reuses the same style of fixture as the "completes within a reasonable
+    // time" test above -- large enough that opportunistic eating is expected
+    // to trigger many times along the way (verified during development), not
+    // a specially-contrived edge case.
+    const weekCount = 53;
+    const dayCount = 7;
+    const rows: string[] = [];
+    for (let d = 0; d < dayCount; d += 1) {
+      let row = "";
+      for (let w = 0; w < weekCount; w += 1) {
+        row += (w + d) % 3 === 0 ? "#" : ".";
+      }
+      rows.push(row);
+    }
+    const grid = buildGrid(rows);
+
+    const result = solveSnakePath(grid);
+
+    expect(result.isFullyCovered).toBe(true);
+    expect(result.eatenContributionCount).toBe(result.totalContributedCells);
+
+    const eatenKeys = result.steps.filter((s) => s.ateContribution).map((s) => cellKey(s.cell));
+    expect(new Set(eatenKeys).size).toBe(eatenKeys.length);
+
+    const expectedKeys = contributedCellsOf(grid).map(cellKey).sort();
+    expect(eatenKeys.slice().sort()).toEqual(expectedKeys);
+  });
+});
