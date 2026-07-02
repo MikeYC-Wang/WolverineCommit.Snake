@@ -158,44 +158,6 @@ function stepBoundaryFrameIndices(steps: readonly SnakePathStep[]): number[] {
 }
 
 /**
- * Gap, at every step boundary, between a lagged body segment's actual
- * (post-`clampArcLengthToMaxSpeed`) rendered position and its *ideal*
- * (unclamped) time-shifted target -- both expressed as *arc-length* (px
- * traveled along the head's own path), not raw (x,y) Euclidean distance.
- *
- * Arc-length is the correct unit for this gap under the arc-length
- * reparameterization fix: the whole point of that fix is that a segment
- * "catching up" always walks the head's actual route rather than cutting a
- * Euclidean shortcut across it, so a segment sitting exactly on the path but
- * a corner's-worth "behind" the ideal target can easily have a *larger* raw
- * (x,y) distance to that target than a segment that's Euclidean-closer but
- * off-path -- that isn't a regression, it's the fix working. Measuring the
- * gap along the path instead makes "shrinking" mean what it should: less
- * ground left to walk, monotonically, regardless of how many corners that
- * ground has.
- *
- * At step boundary `s`, the ideal target for a segment lagging `stepLag`
- * steps behind the head is exactly the head's own actual arc-length position
- * at step boundary `s - stepLag` (or the start position, if that would be
- * before the loop began) -- see `headArcLengthAtTime`/`laggedPositions` in
- * renderSnake.ts, and the design-decision comment on
- * `clampArcLengthToMaxSpeed` for why this gap is not always zero.
- */
-function gapsAtStepBoundaries(steps: readonly SnakePathStep[], svg: string, stepLag: number): number[] {
-  const boundaryFrame = stepBoundaryFrameIndices(steps);
-  const headPositions = parseNodePositions(svg, "wolverine-snake-head");
-  const headArcLengths = buildCumulativeArcLengthLocal(headPositions);
-  const bodyPositions = parseNodePositions(svg, `wolverine-snake-body-${stepLag - 1}`);
-  return steps.map((_, stepIndex) => {
-    const idealSourceStep = Math.max(stepIndex - stepLag, 0);
-    const idealArcLength = headArcLengths[boundaryFrame[idealSourceStep]!]!;
-    const actualPoint = bodyPositions[boundaryFrame[stepIndex]!]!;
-    const actualArcLength = arcLengthOfOnPathPoint(actualPoint, headPositions, headArcLengths);
-    return idealArcLength - actualArcLength;
-  });
-}
-
-/**
  * Whether point `p` lies on the closed segment `[a, b]` (within `tolerance`
  * px of perpendicular distance from the infinite line, and within the
  * segment's own extent -- not just anywhere on the line through it).
@@ -224,35 +186,6 @@ function isOnHeadPolyline(p: Point, headPositions: readonly Point[], tolerance =
     if (isOnSegment(p, headPositions[i - 1]!, headPositions[i]!, tolerance)) return true;
   }
   return false;
-}
-
-/** Mirrors `buildCumulativeArcLength` (renderSnake.ts) for use in tests, from parsed (x,y) positions. */
-function buildCumulativeArcLengthLocal(positions: readonly Point[]): number[] {
-  const arcLengths: number[] = [0];
-  for (let i = 1; i < positions.length; i += 1) {
-    arcLengths.push(arcLengths[i - 1]! + Math.hypot(positions[i]!.x - positions[i - 1]!.x, positions[i]!.y - positions[i - 1]!.y));
-  }
-  return arcLengths;
-}
-
-/**
- * Arc-length coordinate (px traveled along the head's own polyline) of a
- * point already known to lie exactly on it (e.g. any rendered body-segment
- * position, given the on-path guarantee under test elsewhere in this file).
- * Finds the polyline segment `p` lies on and linearly interpolates between
- * that segment's own cumulative arc-length endpoints.
- */
-function arcLengthOfOnPathPoint(p: Point, headPositions: readonly Point[], cumulativeArcLength: readonly number[]): number {
-  for (let i = 1; i < headPositions.length; i += 1) {
-    const a = headPositions[i - 1]!;
-    const b = headPositions[i]!;
-    if (!isOnSegment(p, a, b)) continue;
-    const segLen = cumulativeArcLength[i]! - cumulativeArcLength[i - 1]!;
-    if (segLen === 0) return cumulativeArcLength[i - 1]!;
-    const t = Math.hypot(p.x - a.x, p.y - a.y) / segLen;
-    return cumulativeArcLength[i - 1]! + t * segLen;
-  }
-  throw new Error("point is not on the head's own traveled polyline");
 }
 
 function totalDurationOf(svg: string): number {
@@ -624,16 +557,13 @@ describe("renderSnake", () => {
     });
   });
 
-  describe("body-lag bounded-speed \"chase\" trade-off (see clampToMaxSpeed design-decision comment)", () => {
-    // Exact per-step-boundary alignment and a hard speed cap are jointly
-    // impossible whenever a long jump is immediately followed by an
-    // arbitrarily short step (there is provably not enough real time to
-    // cover the required ground at the speed limit). The project owner's
-    // call was to relax exact-boundary alignment and guarantee bounded-speed
-    // "chase" motion instead. These tests pin down exactly what that means:
-    // no NaN/backwards positions ever, the gap shrinks whenever slack time
-    // is available, and even with zero slack the steady-state error stays
-    // bounded rather than diverging.
+  describe("body positions are well-formed and speed-bounded", () => {
+    // Body segments are drawn at a fixed arc-length offset behind the head
+    // along the head's own path (see `segmentPositions` in renderSnake.ts),
+    // so they are monotonic and speed-bounded by construction. This block
+    // pins down the remaining well-formedness guarantee: no NaN/undefined/
+    // non-finite positions ever, even for segments with more lag than the
+    // loop has history for.
 
     it("never produces NaN, undefined, or non-finite positions, even for segments with more lag than the loop has history for", () => {
       const bodyLength = 20; // deliberately more segments than there are steps
@@ -654,86 +584,6 @@ describe("renderSnake", () => {
           expect(Number.isFinite(p.y)).toBe(true);
         }
       }
-    });
-
-    it("shrinks the gap to the ideal time-shifted target across recovery steps after a hard jump-then-short transition, until fully resynced", () => {
-      const steps: SnakePathStep[] = [
-        jumpStep([[0, 0]]),
-        jumpStep([
-          [0, 0], [1, 0], [2, 0], [3, 0], [4, 0], [5, 0], [6, 0], [7, 0], [8, 0], [9, 0], [10, 0],
-        ]), // 10-hop jump
-        jumpStep([[10, 0], [10, 1]]), // 1-hop step immediately after -- this is the hard transition where the clamp engages
-        // Recovery slack: ordinary 1-hop steps that don't demand another hard
-        // catch-up, giving the clamped segment room to close the gap. This
-        // needs a few more steps than an equivalent Euclidean-space version
-        // of this test would: catching up now means actually walking the
-        // head's bent route (including the corner at week 10 -> week 9,
-        // where the path turns from the day axis back onto the week axis),
-        // which covers strictly more ground than the old Euclidean shortcut
-        // "as the crow flies" toward the same eventual target -- so full
-        // resync legitimately costs more steps' worth of speed-capped travel
-        // than it used to.
-        jumpStep([[10, 1], [10, 2]]),
-        jumpStep([[10, 2], [10, 3]]),
-        jumpStep([[10, 3], [10, 4]]),
-        jumpStep([[10, 4], [10, 5]]),
-        jumpStep([[10, 5], [10, 6]]),
-        jumpStep([[9, 6], [8, 6]]),
-        jumpStep([[8, 6], [7, 6]]),
-        jumpStep([[7, 6], [6, 6]]),
-        jumpStep([[6, 6], [5, 6]]),
-        jumpStep([[5, 6], [4, 6]]),
-      ];
-      const svg = renderSnake(steps, 1);
-      const gaps = gapsAtStepBoundaries(steps, svg, 1);
-
-      const hardTransitionIndex = 2;
-      // Right after the hard transition, segment 0 is measurably behind its
-      // ideal target -- the mathematically-unavoidable gap QA proved.
-      expect(gaps[hardTransitionIndex]).toBeGreaterThan(50);
-
-      // Across every recovery step that follows, the gap must never grow or
-      // oscillate back up -- only shrink or (once resynced) hold at zero.
-      for (let i = hardTransitionIndex; i < gaps.length - 1; i += 1) {
-        expect(gaps[i + 1]).toBeLessThanOrEqual(gaps[i]! + 1e-9);
-      }
-      // It must also make real, strict progress and be fully resynced
-      // (within a tight tolerance) before the recovery steps run out.
-      expect(gaps.at(-1)!).toBeLessThan(gaps[hardTransitionIndex]!);
-      expect(gaps.at(-1)!).toBeLessThan(1e-6);
-    });
-
-    it("keeps the steady-state error bounded (not growing cycle over cycle) under a repeating hard jump/short-step pattern with no recovery slack", () => {
-      // QA's pathological shape: the jump/short-step hard transition repeats
-      // back-to-back, cycle after cycle, with no slack steps in between for
-      // the clamp to fully catch up on. This is the case where exact
-      // resync is impossible by construction -- what's guaranteed instead is
-      // that the offset settles into a stable, bounded steady state rather
-      // than growing without limit.
-      const steps: SnakePathStep[] = [jumpStep([[0, 0]])];
-      let week = 0;
-      let day = 0;
-      const cycleCount = 8;
-      for (let cycle = 0; cycle < cycleCount; cycle += 1) {
-        const jumpPath: Array<[number, number]> = [];
-        for (let hop = 0; hop <= 10; hop += 1) jumpPath.push([week + hop, day]);
-        week += 10;
-        steps.push(jumpStep(jumpPath)); // 10-hop jump
-        const nextDay = (day + 1) % 7;
-        steps.push(jumpStep([[week, day], [week, nextDay]])); // 1-hop step, immediately next -- no slack before the next cycle's jump
-        day = nextDay;
-      }
-
-      const svg = renderSnake(steps, 1);
-      const gaps = gapsAtStepBoundaries(steps, svg, 1);
-
-      // Step index of the "after short step" boundary for cycle c (0-indexed): 2*c + 2.
-      const secondCycleGap = gaps[2 * 1 + 2]!;
-      const eighthCycleGap = gaps[2 * (cycleCount - 1) + 2]!;
-
-      expect(secondCycleGap).toBeGreaterThan(0); // the hard pattern really does produce a persistent, non-zero offset
-      // The offset must be a stable, bounded steady state, not a divergence.
-      expect(eighthCycleGap).toBeCloseTo(secondCycleGap, 5);
     });
   });
 
@@ -806,9 +656,11 @@ describe("renderSnake", () => {
 
       // Before the fix, the segment sat frozen at the start cell for
       // essentially the entire sparse region (tens of consecutive frames,
-      // one per hop of the two ~25-30-hop jumps). After the fix it should
-      // move on virtually every hop instead.
-      expect(staticRun).toBeLessThan(3);
+      // one per hop of the two ~25-30-hop jumps). With the fixed arc-length
+      // spacing model it only rests at the start for the handful of opening
+      // hops it takes the head to travel one segment-offset's worth of path,
+      // then advances on essentially every hop after that.
+      expect(staticRun).toBeLessThan(6);
       expect(growthPositions.length).toBeGreaterThan(40); // sanity: the sparse region really does span this many hop-frames
 
       // The segment should also track reasonably close to the head
