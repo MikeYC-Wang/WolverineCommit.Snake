@@ -449,7 +449,8 @@ export function solveSnakePath(
   // guard), keep the simpler greedy tour instead.
   const plannedTour = tourLength(optimizedTour) <= tourLength(greedyTour) ? optimizedTour : greedyTour;
 
-  const steps = simulateTour(grid, plannedTour, bodyLength);
+  const contributedKeys = new Set(contributedCells.map((c) => cellKey(c)));
+  const steps = simulateTour(grid, plannedTour, bodyLength, contributedKeys);
   const eatenContributionCount = steps.reduce((count, step) => count + (step.ateContribution ? 1 : 0), 0);
 
   return {
@@ -462,10 +463,118 @@ export function solveSnakePath(
   };
 }
 
+/**
+ * Turns a single BFS route into one or more {@link SnakePathStep}s, crediting
+ * every not-yet-eaten contribution cell the route happens to pass through
+ * ("opportunistic eating") rather than only the route's final `target`.
+ *
+ * A plain BFS route to `target` frequently passes through OTHER contributed
+ * cells that just haven't been visited yet -- BFS has no notion of
+ * contributions, it just finds the shortest path through non-blocked cells.
+ * Visually the snake's head tweens through every waypoint in the route, so
+ * any un-eaten contribution cell it crosses should fade/disappear exactly
+ * like a deliberately-targeted one; otherwise the grid-fade animation never
+ * fires for it even though the snake clearly passed over it. This also tends
+ * to shrink the tour, since a cell credited opportunistically no longer needs
+ * a dedicated later trip.
+ *
+ * The route is walked in order and split into one {@link SnakePathStep} per
+ * newly-discovered opportunistic cell, plus a final step at `target`.
+ * `visited`/`remaining` are updated incrementally after each split (so later
+ * splits in the same route, and the next tick, see up-to-date state instead
+ * of a stale snapshot from before this route was committed) -- but `body`
+ * (the self-collision blocked-set) is only advanced once, at `target`, same
+ * as the original single-step-per-route logic. This is deliberate, not an
+ * oversight: `body` only ever reflects planned tour stops, never incidental
+ * waypoints (that was already true pre-fix -- a route's non-final waypoints
+ * never entered `body` either). Advancing `body` once per *split* instead
+ * (i.e. once per newly-credited cell) was tried and reverted: it changes how
+ * fast the tail evicts/re-blocks cells relative to a plain BFS jump of the
+ * same length, which desyncs `isSafeMove`'s tuning from the dynamics it was
+ * validated against and reproduces exactly the kind of corner self-trap it
+ * exists to prevent (see the "early corner sweep" / "wall off a whole
+ * column" regression tests) on some dense boards. Since `body` is purely an
+ * internal planning aid (never exposed on {@link SolveSnakePathResult}), and
+ * since `isSafeMove`/`pickWanderNeighbor`/tour construction are explicitly
+ * out of scope for this fix, keeping `body`'s update cadence unchanged is
+ * the safer choice: everything downstream of it keeps behaving exactly as
+ * before for any given sequence of chosen targets.
+ */
+function recordRouteSteps(
+  route: readonly GridCell[],
+  target: GridCell,
+  contributedKeys: ReadonlySet<string>,
+  body: GridCell[],
+  bodyLength: number,
+  visited: Set<string>,
+  remaining: GridCell[],
+  steps: SnakePathStep[],
+): void {
+  // Defensive guard: `route.length` is always >= 2 in practice, because
+  // `target` is always drawn from `remaining` and `head` (== route[0]) is
+  // always in `visited`, and the two sets are disjoint by construction --
+  // so `head` can never equal `target`. Handle the degenerate case anyway so
+  // a future invariant break fails safe (still emits the step) rather than
+  // silently dropping it.
+  if (route.length < 2) {
+    visited.add(cellKey(target));
+    const idx = remaining.findIndex((c) => cellsEqual(c, target));
+    if (idx >= 0) remaining.splice(idx, 1);
+    body.unshift(target);
+    if (body.length > bodyLength + 1) body.pop();
+    steps.push({
+      cell: target,
+      waypoints: route,
+      isJump: false,
+      ateContribution: true,
+      isLoopComplete: remaining.length === 0,
+    });
+    return;
+  }
+
+  // Index into `route` marking the start of the current not-yet-emitted
+  // sub-route (inclusive); begins at the current head (route[0]).
+  let segmentStart = 0;
+
+  for (let i = 1; i < route.length; i += 1) {
+    const cell = route[i];
+    if (!cell) continue;
+
+    const isTarget = i === route.length - 1;
+    const key = cellKey(cell);
+    const isOpportunistic = !isTarget && contributedKeys.has(key) && !visited.has(key);
+    if (!isTarget && !isOpportunistic) continue; // plain pass-through cell: keep extending the sub-route
+
+    const subRoute = route.slice(segmentStart, i + 1);
+    segmentStart = i;
+
+    visited.add(key);
+    const remainingIndex = remaining.findIndex((c) => cellsEqual(c, cell));
+    if (remainingIndex >= 0) remaining.splice(remainingIndex, 1);
+
+    // Only the route's actual final target advances the self-collision
+    // `body` window -- see the doc comment above for why opportunistically-
+    // credited intermediate cells deliberately do not.
+    if (isTarget) {
+      body.unshift(cell);
+      if (body.length > bodyLength + 1) body.pop();
+    }
+
+    steps.push({
+      cell,
+      waypoints: subRoute,
+      isJump: subRoute.length > 2,
+      ateContribution: true,
+      isLoopComplete: remaining.length === 0,
+    });
+  }
+}
+
 function simulateTour(
   grid: ContributionGrid,
   plannedTour: readonly GridCell[],
   bodyLength: number,
+  contributedKeys: ReadonlySet<string>,
 ): SnakePathStep[] {
   const totalCells = grid.weekCount * grid.dayCount;
   const safetyCap = Math.max(totalCells * SAFETY_MULTIPLIER, 1000);
@@ -555,19 +664,7 @@ function simulateTour(
     if (route && targetIndex >= 0) {
       const target = remaining[targetIndex];
       if (!target) break;
-      remaining.splice(targetIndex, 1);
-      visited.add(cellKey(target));
-
-      body.unshift(target);
-      if (body.length > bodyLength + 1) body.pop();
-
-      steps.push({
-        cell: target,
-        waypoints: route,
-        isJump: route.length > 2,
-        ateContribution: true,
-        isLoopComplete: remaining.length === 0,
-      });
+      recordRouteSteps(route, target, contributedKeys, body, bodyLength, visited, remaining, steps);
       continue;
     }
 
