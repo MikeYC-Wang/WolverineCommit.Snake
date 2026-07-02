@@ -137,25 +137,44 @@ function waypointPosition(steps: readonly SnakePathStep[], stepIndex: number, ho
  *
  * The fix blends the lag itself from `0` at `stepIndex === 0` (where the
  * segment must exactly coincide with the head -- the whole snake really is
- * a single point at the very top of the loop) up towards its full value as
- * `stepIndex` approaches `stepLag`, using `lag = frameTimeMs * (stepIndex /
- * stepLag)`. Scaling directly against this *frame's own* elapsed time
- * (rather than, say, the step's end time, or an estimate of the eventual
- * full-lag duration read ahead from `absoluteTimesMs[stepLag]`) is what
- * guarantees the fix actually holds: since `stepIndex / stepLag < 1`
- * whenever this branch runs, the resulting lag is always *strictly less
- * than* `frameTimeMs` itself, so `frameTimeMs - lag` can never go negative
- * and hit `headPositionAtTime`'s start-of-loop clamp -- the segment is
- * mathematically guaranteed to keep advancing every single hop rather than
- * freezing. (An earlier version of this fix scaled a fixed, precomputed
- * "full lag once grown" figure by `stepIndex / stepLag` instead; that
- * over-corrected whenever later steps in the loop were much longer than
- * earlier ones, since the fixed figure could exceed the *current* step's
- * own elapsed time and reintroduce multi-hop freezes within the growth
- * phase itself -- exactly the bug this fix exists to remove.) At
- * `stepIndex === 0`, `frameTimeMs` is itself `0`, so the lag is `0`
- * regardless -- matching the required "segment coincides with head" state
- * at the very top of the loop.
+ * a single point at the very top of the loop) up towards a fraction of its
+ * full value by the time growth completes, using
+ * `lag = frameTimeMs^2 / (2 * referenceMs)`, where `referenceMs` is the
+ * absolute time at which this segment's growth phase ends (`stepIndex ===
+ * stepLag`) -- i.e. `lag` grows *quadratically*, not linearly, in
+ * `frameTimeMs`.
+ *
+ * That specific shape is what makes the resulting *target* time
+ * (`frameTimeMs - lag`, what `headArcLengthAtTime`/`headPositionAtTime`
+ * actually samples) provably monotonic non-decreasing across the *entire*
+ * growth phase -- including across step boundaries, where an earlier version
+ * of this blend (scaling linearly by `stepIndex / stepLag`, re-evaluated
+ * fresh at each step's own elapsed time) could dip backward: that version
+ * kept the lag safely below `frameTimeMs` *within* a step, but the fraction
+ * itself jumped upward at each new step's very first hop while `frameTimeMs`
+ * had barely advanced, so the lag could jump up *faster* than real time was
+ * passing, pulling the target backward for a stretch. Since this fix went in
+ * (see arc-length reparameterization commit), the rendered arc-length is
+ * *never* allowed to decrease (see `clampArcLengthToMaxSpeed`), so a
+ * backward-dipping target no longer just nudges the position back slightly
+ * -- it freezes the segment in place until real time catches back up past
+ * the dip, reintroducing a real (if shorter-lived) version of the frozen-tail
+ * bug this whole function exists to prevent.
+ *
+ * The quadratic instead guarantees `d(target)/d(frameTimeMs) = 1 -
+ * frameTimeMs/referenceMs > 0` for every `frameTimeMs` in the growth phase
+ * (which by definition never reaches `referenceMs`), with no special-casing
+ * needed at step boundaries: the formula depends only on the frame's own
+ * absolute time, not on which step it belongs to, so there's nothing to
+ * jump. At `stepIndex === 0`, `frameTimeMs` is `0`, so the lag is `0`
+ * regardless -- matching the required "segment coincides with head" state at
+ * the very top of the loop. `referenceMs` itself is read from
+ * `absoluteTimesMs[stepLag]` where available; if `stepLag` reaches past the
+ * end of the loop (more body segments than steps -- see the "more lag than
+ * history" test), it falls back to the loop's own total duration, which
+ * keeps the growth phase (and thus this formula) in effect for the entire
+ * loop, exactly as intended for a segment that never accumulates `stepLag`
+ * steps of real history within one loop iteration.
  */
 function lagDurationMs(
   absoluteTimesMs: readonly number[],
@@ -169,50 +188,125 @@ function lagDurationMs(
     return endMs - absoluteTimesMs[startIndex]!;
   }
 
-  const growthProgress = stepLag > 0 ? stepIndex / stepLag : 1;
+  const referenceMs = absoluteTimesMs[stepLag] ?? absoluteTimesMs.at(-1) ?? 0;
+  if (referenceMs <= 0) return 0;
+  const growthProgress = frameTimeMs / (2 * referenceMs);
   return frameTimeMs * growthProgress;
 }
 
 /**
- * Linearly interpolates the head's own position at an arbitrary absolute
- * `timeMs`, given the head's full (monotonic) hop-keyframe timeline. This is
- * the crux of the fix for body segments snapping (see module docs on
- * `laggedPositions`): rather than replaying a *different* step's waypoints
- * at the *current* step's fractional progress (which desyncs badly whenever
- * the two steps have very different hop counts), we read the lagged
- * position directly off the head's own continuous trajectory, evaluated
- * `stepLag`-steps'-worth of real time in the past. `timeMs` before the first
- * keyframe (i.e. before the loop even started) clamps to the start position,
- * which is exactly the "not enough history yet" case at the top of a loop.
+ * Generic keyframe lookup: given a monotonic non-decreasing `keys` array
+ * (e.g. absolute times, or cumulative arc-length) and a parallel `values`
+ * array, binary-searches for the bounding pair of keyframes surrounding
+ * `key` and linearly interpolates between their values in proportion to how
+ * far `key` falls between the two bounding keys. `key` outside the array's
+ * range clamps to the nearest end, so a lookup before the loop even started
+ * (or past its very end) resolves to the start/end value instead of
+ * extrapolating.
+ *
+ * Every keyframe lookup in this module -- time -> position, time ->
+ * arc-length, and arc-length -> position -- is structurally this same
+ * search-and-lerp operation over a different pair of parallel arrays, so
+ * they all share this one implementation (see `headPositionAtTime`,
+ * `headArcLengthAtTime`, `headPositionAtArcLength` below).
  */
-function headPositionAtTime(times: readonly number[], positions: readonly Point[], timeMs: number): Point {
-  const lastIndex = times.length - 1;
-  const clampedTime = Math.min(Math.max(timeMs, times[0]!), times[lastIndex]!);
+function interpolateAlongKeyframes<T>(
+  keys: readonly number[],
+  values: readonly T[],
+  key: number,
+  lerp: (before: T, after: T, progress: number) => T,
+): T {
+  const lastIndex = keys.length - 1;
+  const clampedKey = Math.min(Math.max(key, keys[0]!), keys[lastIndex]!);
 
   let low = 0;
   let high = lastIndex;
   while (low < high) {
     const mid = (low + high) >> 1;
-    if (times[mid]! < clampedTime) low = mid + 1;
+    if (keys[mid]! < clampedKey) low = mid + 1;
     else high = mid;
   }
-  if (low === 0 || times[low] === clampedTime) return positions[low]!;
+  if (low === 0 || keys[low] === clampedKey) return values[low]!;
 
-  const beforeTime = times[low - 1]!;
-  const afterTime = times[low]!;
-  const before = positions[low - 1]!;
-  const after = positions[low]!;
-  const span = afterTime - beforeTime;
-  const progress = span > 0 ? (clampedTime - beforeTime) / span : 0;
+  const beforeKey = keys[low - 1]!;
+  const afterKey = keys[low]!;
+  const before = values[low - 1]!;
+  const after = values[low]!;
+  const span = afterKey - beforeKey;
+  const progress = span > 0 ? (clampedKey - beforeKey) / span : 0;
+  return lerp(before, after, progress);
+}
+
+function lerpPoint(before: Point, after: Point, progress: number): Point {
   return {
     x: before.x + (after.x - before.x) * progress,
     y: before.y + (after.y - before.y) * progress,
   };
 }
 
+function lerpNumber(before: number, after: number, progress: number): number {
+  return before + (after - before) * progress;
+}
+
+/**
+ * Linearly interpolates the head's own position at an arbitrary absolute
+ * `timeMs`, given the head's full (monotonic) hop-keyframe timeline. `timeMs`
+ * before the first keyframe (i.e. before the loop even started) clamps to
+ * the start position, which is exactly the "not enough history yet" case at
+ * the top of a loop.
+ */
+function headPositionAtTime(times: readonly number[], positions: readonly Point[], timeMs: number): Point {
+  return interpolateAlongKeyframes(times, positions, timeMs, lerpPoint);
+}
+
+/**
+ * Linearly interpolates the head's own *cumulative arc-length* (how far
+ * along its own path it has traveled, in px -- see `buildCumulativeArcLength`)
+ * at an arbitrary absolute `timeMs`. This is the arc-length twin of
+ * `headPositionAtTime`, used so a lagged body segment's "ideal target" can be
+ * expressed as a 1D distance-along-path instead of a raw (x,y) point (see
+ * module docs on `laggedPositions` for why that distinction is the whole
+ * point of this fix).
+ */
+function headArcLengthAtTime(times: readonly number[], arcLengths: readonly number[], timeMs: number): number {
+  return interpolateAlongKeyframes(times, arcLengths, timeMs, lerpNumber);
+}
+
+/**
+ * Inverse of `buildCumulativeArcLength`: given a target arc-length `s`
+ * (a distance traveled along the head's own path, in px), finds the pair of
+ * consecutive head keyframes whose cumulative arc-length brackets `s` and
+ * linearly interpolates the (x,y) position between them, proportional to how
+ * far `s` falls between their arc-length values. Because the interpolation is
+ * always between two *consecutive* keyframes on the head's actual route,
+ * every value this can return lies exactly on one of the head's own traveled
+ * segments -- never a Euclidean shortcut through cells the head's route never
+ * touched. `s` outside `[0, totalArcLength]` clamps to the start/end position.
+ */
+function headPositionAtArcLength(arcLengths: readonly number[], positions: readonly Point[], targetArcLength: number): Point {
+  return interpolateAlongKeyframes(arcLengths, positions, targetArcLength, lerpPoint);
+}
+
 /** Straight-line distance between two points. */
 function distanceBetween(a: Point, b: Point): number {
   return Math.hypot(b.x - a.x, b.y - a.y);
+}
+
+/**
+ * Cumulative distance traveled (px), one entry per head keyframe, parallel to
+ * `positions` -- `arcLength[0]` is `0`, `arcLength[i]` is the total
+ * straight-line distance covered walking
+ * `positions[0] -> positions[1] -> ... -> positions[i]`. This is the "1D
+ * odometer reading" for the head's own path: any value in
+ * `[0, arcLength.at(-1)]` maps, via `headPositionAtArcLength`, to a point that
+ * lies exactly on one of the head's own traveled segments.
+ */
+function buildCumulativeArcLength(positions: readonly Point[]): number[] {
+  const arcLengths: number[] = [0];
+  for (let i = 1; i < positions.length; i += 1) {
+    arcLengths.push(arcLengths[i - 1]! + distanceBetween(positions[i - 1]!, positions[i]!));
+  }
+  return arcLengths;
 }
 
 /**
@@ -232,16 +326,25 @@ function maxConsecutiveDistance(positions: readonly Point[]): number {
 }
 
 /**
- * Caps each frame-to-frame movement in `positions` to at most `maxDistancePx`
- * (moving as far as allowed toward the original position, rather than
- * discarding the frame entirely), so a sequence built from time-shifted
- * samples (see `laggedPositions`) can never move faster than the head's own
- * worst single hop even when the *ideal* time-shifted position would require
- * covering many hops within a single frame (e.g. a long jump immediately
- * followed by a very short step -- the exact shape QA's repro exercises).
- * Any distance this trims off is made up as fast as the speed cap allows on
- * subsequent frames, since the ideal target keeps advancing independently of
- * how far behind the clamped trail currently sits.
+ * Caps each frame-to-frame *advance in arc-length* (how far a body segment is
+ * currently drawn along the head's own path, see `buildCumulativeArcLength`)
+ * to at most `maxAdvancePerFramePx`, and never lets the rendered arc-length
+ * decrease -- a trailing segment can't move backward along the path it's
+ * chasing. Any distance this trims off is made up as fast as the speed cap
+ * allows on subsequent frames, since the ideal arc-length target keeps
+ * advancing independently of how far behind the clamped trail currently sits.
+ *
+ * This replaces an earlier version of this clamp that operated on raw (x,y)
+ * positions, moving in a straight Euclidean line toward the ideal target
+ * whenever it was farther than `maxDistancePx` away. That straight line was
+ * not constrained to the grid at all: it could (and, per the reported bug,
+ * visibly did) cut diagonally across cells the head's actual route never
+ * touched, especially while "catching up" after a long jump -- exactly when
+ * this clamp engages most. Clamping the *arc-length* scalar instead means
+ * every intermediate value, once converted back to (x,y) via
+ * `headPositionAtArcLength`, is guaranteed to fall exactly on the head's own
+ * polyline path: catching up now means walking the same route faster, never
+ * shortcutting across unrelated grid space.
  *
  * ## Design decision: bounded-speed "chase" motion, not exact-boundary alignment
  *
@@ -258,7 +361,10 @@ function maxConsecutiveDistance(positions: readonly Point[]): number {
  * 53x7/296-step fixture found mismatches at 169/430 (39%) of sampled step
  * boundaries across lags 1-10. A repeating long-jump/short-step pattern with
  * no recovery slack between cycles was also shown to *not* self-correct: the
- * same offset recurs identically cycle over cycle.
+ * same offset recurs identically cycle over cycle. (These findings were made
+ * against the raw-(x,y) version of this clamp, but the same real-time
+ * argument applies verbatim to the arc-length version: the amount of *path
+ * distance* to cover doesn't change, only how the catch-up motion is drawn.)
  *
  * The project owner's call, given that tension: relax the exact-boundary
  * requirement and render body segments as bounded-speed "chase" motion
@@ -283,26 +389,21 @@ function maxConsecutiveDistance(positions: readonly Point[]): number {
  *      jump/short-step pattern with *no* recovery slack at all, the
  *      steady-state error stays bounded rather than growing cycle over
  *      cycle -- it settles into a stable offset, not a divergence.
+ *   5. On-path: every rendered position lies exactly on one of the head's own
+ *      traveled path segments (this function operates on arc-length, and the
+ *      final (x,y) is always produced via `headPositionAtArcLength`).
  * What is explicitly NOT guaranteed: exact pixel/cell alignment at every
  * single step boundary under adversarial (mismatched-hop-count) adjacent
  * steps.
  */
-function clampToMaxSpeed(positions: readonly Point[], maxDistancePx: number): Point[] {
-  if (positions.length === 0) return [];
-  const result: Point[] = [positions[0]!];
-  for (let i = 1; i < positions.length; i += 1) {
+function clampArcLengthToMaxSpeed(idealArcLengths: readonly number[], maxAdvancePerFramePx: number): number[] {
+  if (idealArcLengths.length === 0) return [];
+  const result: number[] = [idealArcLengths[0]!];
+  for (let i = 1; i < idealArcLengths.length; i += 1) {
     const previous = result[i - 1]!;
-    const ideal = positions[i]!;
-    const distance = distanceBetween(previous, ideal);
-    if (distance <= maxDistancePx) {
-      result.push(ideal);
-    } else {
-      const scale = maxDistancePx / distance;
-      result.push({
-        x: previous.x + (ideal.x - previous.x) * scale,
-        y: previous.y + (ideal.y - previous.y) * scale,
-      });
-    }
+    const ideal = idealArcLengths[i]!;
+    const capped = Math.min(ideal, previous + maxAdvancePerFramePx);
+    result.push(Math.max(previous, capped)); // monotonic: never walk backward along the path
   }
   return result;
 }
@@ -345,6 +446,14 @@ export function renderSnake(steps: readonly SnakePathStep[], bodyLength: number)
   const headTimelineTimesMs = [...hopFrames.map((frame) => frame.timeMs), totalDurationMs];
   const maxHeadHopDistancePx = maxConsecutiveDistance(headPositions);
 
+  // The head's own path expressed as a 1D "odometer reading" (px traveled)
+  // parallel to `extendedHeadPositions`/`headTimelineTimesMs`. Every body
+  // segment's position is derived by walking *this* array rather than ever
+  // computing a raw (x,y) target directly, which is what guarantees a
+  // clamped/catching-up segment stays exactly on the head's own route (see
+  // `clampArcLengthToMaxSpeed` and `headPositionAtArcLength`).
+  const headCumulativeArcLength = buildCumulativeArcLength(extendedHeadPositions);
+
   /**
    * Position sequence of the body segment trailing `stepLag` *steps* (not
    * hops) behind the head -- matching solveSnakePath's actual body-occupancy
@@ -353,27 +462,67 @@ export function renderSnake(steps: readonly SnakePathStep[], bodyLength: number)
    * waypoints at the current step's fractional hop-progress (the old
    * approach, which desyncs badly whenever the shifted and current steps
    * have very different hop counts -- see project report, "the snake body
-   * snaps/teleports"), this reads the segment's position directly off the
-   * head's own trajectory at (this frame's time minus the real duration of
-   * the `stepLag` most recent steps). That makes the *ideal* target an exact,
-   * undistorted echo of however the head actually moved, just shifted later
-   * in time -- but the position actually rendered is `clampToMaxSpeed`'s
-   * output, not that ideal target directly. `clampToMaxSpeed` caps the
-   * segment's per-frame travel whenever the ideal time-shifted target would
-   * itself require covering more ground than the head's worst single hop
-   * within one frame (e.g. a long jump immediately followed by a very short
-   * step -- not a rare case; see the design-decision note on
-   * `clampToMaxSpeed` for how often this actually happens and exactly what is
-   * and isn't guaranteed as a result).
+   * snaps/teleports"), this reads the segment's *ideal arc-length* directly
+   * off the head's own trajectory at (this frame's time minus the real
+   * duration of the `stepLag` most recent steps) -- an exact, undistorted
+   * echo of how far along its own path the head had traveled at that instant,
+   * just shifted later in time.
+   *
+   * The position actually rendered is not that ideal target directly, but
+   * `clampArcLengthToMaxSpeed`'s output converted back to (x,y) via
+   * `headPositionAtArcLength`. `clampArcLengthToMaxSpeed` caps the segment's
+   * per-frame arc-length advance whenever the ideal time-shifted target would
+   * itself require covering more path distance than the head's worst single
+   * hop within one frame (e.g. a long jump immediately followed by a very
+   * short step -- not a rare case; see the design-decision note on
+   * `clampArcLengthToMaxSpeed` for how often this actually happens and
+   * exactly what is and isn't guaranteed as a result). Because the clamp
+   * operates on the arc-length scalar -- and gets converted back to (x,y)
+   * only at the very end, via `headPositionAtArcLength` -- the "catching up"
+   * motion is always *along the head's own route*, never a Euclidean
+   * shortcut through cells the head's path never touched. The growth-phase
+   * blend inside `lagDurationMs` (see its own doc comments) still governs how
+   * much lag, in *time*, this segment has before it has accumulated
+   * `stepLag` steps of real history; projecting that blended lag through
+   * `headArcLengthAtTime` carries the same guarantees into arc-length space
+   * for free -- at `stepIndex === 0` the lag is exactly `0`, so the ideal
+   * arc-length target is exactly `0` (the head's own start position), and it
+   * blends smoothly up to the full steady-state lag as `stepIndex` approaches
+   * `stepLag`.
    */
   function laggedPositions(stepLag: number): Point[] {
-    const idealPositions = hopFrames.map((frame) => {
+    // `lagDurationMs`'s growth-phase blend scales its lag by *this step's*
+    // elapsed time (see its own doc comments) rather than a running total,
+    // which is what keeps it from ever reintroducing a multi-hop freeze
+    // *within* a step -- but across a step *boundary*, `stepIndex` jumps to a
+    // strictly larger value, shrinking the `(1 - stepIndex/stepLag)` factor
+    // applied to a `frameTimeMs` that has only grown by one hop's worth. When
+    // a step's own total duration is large (exactly the sparse-jump shape
+    // this growth phase exists for), that shrink can outpace the growth,
+    // making the *reference time* -- and so the arc-length read off it --
+    // dip backward for a few frames right at the boundary. `headArcLengthAtTime`
+    // (a monotonic function of time) would faithfully reproduce that dip, and
+    // since the rendered arc-length is contractually never allowed to
+    // decrease (see `clampArcLengthToMaxSpeed`), a dip would freeze the
+    // segment until real time caught back up past it -- reintroducing
+    // exactly the frozen-tail bug this growth-phase blend exists to fix, just
+    // at every growth-phase step boundary instead of at the loop's start.
+    // Clamping the *reference time itself* to be monotonic non-decreasing
+    // (never re-reading an earlier instant than a previous frame already
+    // did) prevents the dip at the source, before it ever reaches the
+    // arc-length domain.
+    let lastTargetTimeMs = -Infinity;
+    const idealArcLengths = hopFrames.map((frame) => {
       const lagMs = lagDurationMs(absoluteTimesMs, frame.stepIndex, stepLag, frame.timeMs);
-      const targetTimeMs = frame.timeMs - lagMs;
-      return headPositionAtTime(headTimelineTimesMs, extendedHeadPositions, targetTimeMs);
+      const targetTimeMs = Math.max(lastTargetTimeMs, frame.timeMs - lagMs);
+      lastTargetTimeMs = targetTimeMs;
+      return headArcLengthAtTime(headTimelineTimesMs, headCumulativeArcLength, targetTimeMs);
     });
-    const clamped = clampToMaxSpeed(idealPositions, maxHeadHopDistancePx);
-    return [...clamped, clamped.at(-1)!];
+    const clampedArcLengths = clampArcLengthToMaxSpeed(idealArcLengths, maxHeadHopDistancePx);
+    const positions = clampedArcLengths.map((arcLength) =>
+      headPositionAtArcLength(headCumulativeArcLength, extendedHeadPositions, arcLength),
+    );
+    return [...positions, positions.at(-1)!];
   }
 
   const headGroup = `
