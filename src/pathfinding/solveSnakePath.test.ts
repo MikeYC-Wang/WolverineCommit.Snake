@@ -36,7 +36,26 @@ function isAdjacent(a: GridCell, b: GridCell): boolean {
   return Math.abs(a.weekIndex - b.weekIndex) + Math.abs(a.dayIndex - b.dayIndex) === 1;
 }
 
-describe("solveSnakePath - boustrophedon crawl", () => {
+/**
+ * Replays the body occupancy and asserts the head never lands on a cell that
+ * another body segment still occupies (moving onto the tail cell it is
+ * vacating is legal). Returns the number of genuine self-overlaps.
+ */
+function selfOverlaps(steps: readonly { cell: GridCell }[], bodyLength: number): number {
+  let overlaps = 0;
+  const body: string[] = [];
+  for (const step of steps) {
+    const key = cellKey(step.cell);
+    const willPop = body.length === bodyLength + 1;
+    const stillOccupied = willPop ? body.slice(0, -1) : body;
+    if (stillOccupied.includes(key)) overlaps += 1;
+    body.unshift(key);
+    if (body.length > bodyLength + 1) body.pop();
+  }
+  return overlaps;
+}
+
+describe("solveSnakePath - contiguous hunting crawl", () => {
   it("returns an empty path for a grid with no contributions", () => {
     const grid = buildGrid([".....", "....."]);
     const result = solveSnakePath(grid);
@@ -46,55 +65,42 @@ describe("solveSnakePath - boustrophedon crawl", () => {
     expect(result.isFullyCovered).toBe(true);
   });
 
-  it("visits every cell in the grid exactly once", () => {
-    const grid = buildGrid(["#..#.", ".#.#.", "..#.#"]); // 5 weeks x 3 days = 15 cells
+  it("starts on the earliest contributed cell in reading order", () => {
+    const grid = buildGrid([".#.#.", "#...#", "..#.."]); // earliest contributed is (0,1)
     const result = solveSnakePath(grid);
-
-    expect(result.steps).toHaveLength(15);
-    const visited = new Set(result.steps.map((s) => cellKey(s.cell)));
-    expect(visited.size).toBe(15);
+    expect(result.startCell).toEqual({ weekIndex: 0, dayIndex: 1 });
+    expect(result.steps[0]!.cell).toEqual({ weekIndex: 0, dayIndex: 1 });
   });
 
-  it("starts at (0,0) and moves one orthogonally-adjacent cell per step", () => {
-    const grid = buildGrid(["#.#", ".#.", "#.#"]);
+  it("moves exactly one orthogonally-adjacent cell per step", () => {
+    const grid = buildGrid(["#.#.#", ".#.#.", "#.#.#"]);
     const result = solveSnakePath(grid);
-
-    expect(result.startCell).toEqual({ weekIndex: 0, dayIndex: 0 });
-    expect(result.steps[0]!.cell).toEqual({ weekIndex: 0, dayIndex: 0 });
     for (let i = 1; i < result.steps.length; i += 1) {
       expect(isAdjacent(result.steps[i - 1]!.cell, result.steps[i]!.cell)).toBe(true);
     }
   });
 
-  it("never lets the head land on a cell its own body currently occupies", () => {
-    const grid = buildGrid(["#.#.#.#", ".#.#.#.", "#.#.#.#"]);
+  it("never lets the head overlap its own body", () => {
+    const grid = buildGrid(["#.#.#.#", ".#.#.#.", "#.#.#.#", ".#.#.#."]);
     const bodyLength = DEFAULT_SNAKE_BODY_LENGTH;
     const result = solveSnakePath(grid, { bodyLength });
-
-    const body: string[] = [];
-    for (const step of result.steps) {
-      const key = cellKey(step.cell);
-      expect(body).not.toContain(key); // head never enters a body cell
-      body.unshift(key);
-      if (body.length > bodyLength + 1) body.pop();
-    }
+    expect(selfOverlaps(result.steps, bodyLength)).toBe(0);
   });
 
-  it("eats every contributed cell (isFullyCovered) regardless of how they are scattered", () => {
+  it("eats every contributed cell (isFullyCovered)", () => {
     const grid = buildGrid(["#....#", ".#..#.", "..##.."]);
     const result = solveSnakePath(grid);
-
     expect(result.eatenContributionCount).toBe(result.totalContributedCells);
     expect(result.isFullyCovered).toBe(true);
   });
 
-  it("marks ateContribution true exactly on the first visit to each contributed cell and false elsewhere", () => {
-    const grid = buildGrid(["#.#", "..."]); // contributions at (0,0) and (2,0)
+  it("credits each contributed cell as eaten exactly once, and never an empty cell", () => {
+    const grid = buildGrid(["#.#", "..."]);
     const result = solveSnakePath(grid);
-
     const ateKeys = result.steps.filter((s) => s.ateContribution).map((s) => cellKey(s.cell));
-    expect(new Set(ateKeys)).toEqual(new Set([cellKey({ weekIndex: 0, dayIndex: 0 }), cellKey({ weekIndex: 2, dayIndex: 0 })]));
-    // No cell is credited as eaten more than once.
+    expect(new Set(ateKeys)).toEqual(
+      new Set([cellKey({ weekIndex: 0, dayIndex: 0 }), cellKey({ weekIndex: 2, dayIndex: 0 })]),
+    );
     expect(ateKeys.length).toBe(new Set(ateKeys).size);
   });
 
@@ -110,17 +116,16 @@ describe("solveSnakePath - boustrophedon crawl", () => {
   it("sets isLoopComplete only on the final step", () => {
     const grid = buildGrid(["#.#", ".#."]);
     const result = solveSnakePath(grid);
-    const completeFlags = result.steps.map((s) => s.isLoopComplete);
-    expect(completeFlags.slice(0, -1).every((f) => f === false)).toBe(true);
-    expect(completeFlags.at(-1)).toBe(true);
+    const flags = result.steps.map((s) => s.isLoopComplete);
+    expect(flags.slice(0, -1).every((f) => f === false)).toBe(true);
+    expect(flags.at(-1)).toBe(true);
   });
 
   it("throws when bodyLength is less than 1", () => {
-    const grid = buildGrid(["#.#"]);
-    expect(() => solveSnakePath(grid, { bodyLength: 0 })).toThrow();
+    expect(() => solveSnakePath(buildGrid(["#.#"]), { bodyLength: 0 })).toThrow();
   });
 
-  it("scales to a full 53x7 calendar with complete coverage and all-adjacent moves", () => {
+  it("covers a dense 53x7 calendar fully with all-adjacent, non-overlapping moves", () => {
     const rows: string[] = [];
     for (let d = 0; d < 7; d += 1) {
       let row = "";
@@ -130,10 +135,21 @@ describe("solveSnakePath - boustrophedon crawl", () => {
     const grid = buildGrid(rows);
     const result = solveSnakePath(grid);
 
-    expect(result.steps).toHaveLength(53 * 7);
     expect(result.isFullyCovered).toBe(true);
+    expect(selfOverlaps(result.steps, result.bodyLength)).toBe(0);
     for (let i = 1; i < result.steps.length; i += 1) {
       expect(isAdjacent(result.steps[i - 1]!.cell, result.steps[i]!.cell)).toBe(true);
     }
+  });
+
+  it("covers a sparse, scattered calendar fully", () => {
+    const rows: string[] = [];
+    for (let d = 0; d < 7; d += 1) {
+      let row = "";
+      for (let w = 0; w < 53; w += 1) row += (w * 7 + d * 3) % 11 === 0 ? "#" : ".";
+      rows.push(row);
+    }
+    const result = solveSnakePath(buildGrid(rows));
+    expect(result.isFullyCovered).toBe(true);
   });
 });

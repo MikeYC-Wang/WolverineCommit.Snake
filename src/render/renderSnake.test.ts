@@ -25,20 +25,21 @@ describe("renderSnake", () => {
     expect(renderSnake([], 10)).toBe("");
   });
 
-  it("renders a single body path plus a head group (no per-node/per-connector blowup)", () => {
-    const svg = renderSnake(adjacentSteps(5), 3);
+  it("renders one shared route path, one head, and one group per body segment", () => {
+    const bodyLength = 4;
+    const svg = renderSnake(adjacentSteps(8), bodyLength);
 
-    expect((svg.match(/<path /g) ?? []).length).toBe(2); // body route path + head arrow path
     expect(svg).toContain('id="wolverine-snake-route"');
     expect(svg).toContain('id="wolverine-snake-head"');
-    expect(svg).toContain(`stroke="${SNAKE_BODY_FILL}"`);
     expect(svg).toContain(`fill="${SNAKE_HEAD_FILL}"`);
     expect(svg).toContain(`stroke="${SNAKE_HEAD_BORDER}"`);
-    // Exactly one animation for the body (dashoffset) -- the head uses animateMotion, not <animate>.
-    expect((svg.match(/<animate /g) ?? []).length).toBe(1);
+    // One body rect per segment (fill = body color), plus the head has none of that fill.
+    expect((svg.match(new RegExp(`fill="${SNAKE_BODY_FILL}"`, "g")) ?? []).length).toBe(bodyLength);
+    // One animateMotion per node: bodyLength body segments + 1 head.
+    expect((svg.match(/<animateMotion/g) ?? []).length).toBe(bodyLength + 1);
   });
 
-  it("traces the route path through every cell centre in order", () => {
+  it("traces the shared route path through every cell centre in order", () => {
     const steps = adjacentSteps(4);
     const svg = renderSnake(steps, 2);
 
@@ -51,47 +52,39 @@ describe("renderSnake", () => {
     }
   });
 
-  it("drives the head along the route via animateMotion with rotate=auto and an mpath reference", () => {
-    const svg = renderSnake(adjacentSteps(4), 2);
+  it("drives every node along the shared route via animateMotion with an mpath reference", () => {
+    const svg = renderSnake(adjacentSteps(6), 3);
 
     expect(svg).toContain("<animateMotion");
-    expect(svg).toContain('rotate="auto"');
     expect(svg).toContain('href="#wolverine-snake-route"');
     expect(svg).toContain('xlink:href="#wolverine-snake-route"');
+    // Only the head auto-rotates (its direction arrow); body squares do not.
+    expect((svg.match(/rotate="auto"/g) ?? []).length).toBe(1);
   });
 
-  it("glides a fixed-length body window: dashoffset starts hidden at the start and ends at the tail", () => {
-    const steps = adjacentSteps(11); // 10 hops -> route length 10 * stride
-    const bodyLength = 4;
-    const svg = renderSnake(steps, bodyLength);
-
-    const match = svg.match(/attributeName="stroke-dashoffset" values="([^"]+)"/);
-    expect(match).not.toBeNull();
-    const [start, mid, end] = match![1]!.split(";").map(Number);
-
-    // The body window is bodyLength cells long; it starts fully hidden before
-    // the start (offset = +window) and finishes at the end (offset =
-    // window - routeLength, negative), then holds there through the pause.
-    expect(start).toBeGreaterThan(0);
-    expect(end).toBeLessThan(0);
-    expect(mid).toBe(end); // holds at the tail during the reset pause
-    expect(start! - end!).toBeGreaterThan(0);
-  });
-
-  it("keeps every animation on a single shared duration so the snake stays in sync with grid + bubbles", () => {
+  it("keeps every animation on a single shared duration so the snake stays in sync with the grid", () => {
     const svg = renderSnake(adjacentSteps(6), 3);
     const durations = [...svg.matchAll(/dur="(\d+)ms"/g)].map((m) => m[1]);
     expect(durations.length).toBeGreaterThan(0);
     expect(new Set(durations).size).toBe(1);
   });
 
-  it("uses compact markup that does not grow with body length", () => {
-    const short = renderSnake(adjacentSteps(40), 2);
-    const long = renderSnake(adjacentSteps(40), 20);
-    // Body length only changes a couple of numbers (dash window), never the
-    // element count -- the old renderer added a group + connector per segment.
-    expect((short.match(/<(path|g|animate|animateMotion)/g) ?? []).length).toBe(
-      (long.match(/<(path|g|animate|animateMotion)/g) ?? []).length,
-    );
+  it("renders a static head (no animation) for a single-cell path", () => {
+    const svg = renderSnake(adjacentSteps(1), 10);
+    expect(svg).toContain('id="wolverine-snake-head"');
+    expect(svg).not.toContain("<animateMotion");
+  });
+
+  it("trails each body segment a fixed number of cells behind (later segments end further back)", () => {
+    // On a long straight run, body segment k finishes at path fraction
+    // 1 - k*cellFraction, so its animateMotion end keyPoint strictly decreases
+    // as k grows -- i.e. deeper segments sit further back.
+    const svg = renderSnake(adjacentSteps(21), 5); // cellFraction = 1/20 = 0.05
+    const endPoints = [...svg.matchAll(/keyPoints="0;0;([\d.]+);[\d.]+"/g)].map((m) => Number(m[1]));
+    expect(endPoints.length).toBe(5);
+    // Rendered furthest-first, so the parsed sequence is strictly increasing.
+    for (let i = 1; i < endPoints.length; i += 1) {
+      expect(endPoints[i]).toBeGreaterThan(endPoints[i - 1]!);
+    }
   });
 });

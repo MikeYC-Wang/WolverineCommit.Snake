@@ -33,12 +33,11 @@ export const EVENT_CONNECTOR_OPACITY = 0.35;
 /** Animation timing constants, all in milliseconds. Source: visual-design.md section 5. */
 export const ANIMATION_TIMING = {
   /**
-   * Time for the snake's head to advance one grid cell. The snake now crawls
-   * the whole grid one adjacent cell at a time (see solveSnakePath), so this
-   * is a per-cell tempo rather than the old per-jump one -- kept brisk so a
-   * full ~371-cell sweep reads as a lively crawl (~30s) rather than a slog.
+   * Time for the snake's head to advance one grid cell. The snake crawls the
+   * whole grid one adjacent cell at a time (see solveSnakePath), so this is a
+   * per-cell tempo -- kept slow enough that each move is clearly readable.
    */
-  stepDurationMs: 80,
+  stepDurationMs: 120,
   eventBubble: {
     fadeInMs: 100,
     holdMs: 200,

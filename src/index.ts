@@ -4,7 +4,6 @@ import path from "node:path";
 import { fetchContributions } from "./data/fetchContributions.js";
 import { DEFAULT_SNAKE_BODY_LENGTH, solveSnakePath } from "./pathfinding/solveSnakePath.js";
 import { svgDimensionsFor } from "./render/layout.js";
-import { renderEventBubble } from "./render/renderEventBubble.js";
 import { renderGrid } from "./render/renderGrid.js";
 import { renderSnake } from "./render/renderSnake.js";
 
@@ -53,13 +52,11 @@ function renderSvgDocument(
   width: number,
   height: number,
   gridMarkup: string,
-  bubbleMarkup: string,
   snakeMarkup: string,
 ): string {
   return [
     `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
     gridMarkup,
-    bubbleMarkup,
     snakeMarkup,
     `</svg>`,
   ].join("\n");
@@ -81,7 +78,6 @@ async function main(): Promise<void> {
     width,
     height,
     renderGrid(grid, solution.steps),
-    renderEventBubble(grid, solution.steps, solution.bodyLength),
     renderSnake(solution.steps, solution.bodyLength),
   );
 
