@@ -6,19 +6,8 @@ import {
   EVENT_BUBBLE_FILL,
   EVENT_BUBBLE_OPACITY_BY_LEVEL,
   EVENT_BUBBLE_RADIUS_BY_LEVEL,
-  EVENT_CONNECTOR_COLOR,
-  EVENT_CONNECTOR_OPACITY,
 } from "./theme.js";
 import { buildLoopTimeline, computeStepDurationsMs } from "./timeline.js";
-
-interface Point {
-  readonly x: number;
-  readonly y: number;
-}
-
-function distance(a: Point, b: Point): number {
-  return Math.hypot(a.x - b.x, a.y - b.y);
-}
 
 /**
  * Builds an opacity keyframe track that is 0 everywhere except a single
@@ -66,20 +55,24 @@ function animateOpacity(keyTimes: readonly number[], values: readonly number[], 
 }
 
 /**
- * Renders one "Event bubble" per eaten cell: a small circle sized/brightened
- * by the cell's contribution level, plus a connector line animating toward
- * the tail position at the moment of eating (visual-design.md 2.3 / 5).
- * Wander steps (see solveSnakePath dead-end fallback) don't eat anything and
- * so never spawn a bubble.
+ * Renders one "Event bubble" per eaten cell: a small amber circle sized and
+ * brightened by the cell's contribution level, popping in at the moment the
+ * snake's head passes over it (visual-design.md 2.3 / 5). Empty cells the
+ * snake merely sweeps across (ateContribution === false) never spawn a bubble.
+ *
+ * The bubble is deliberately just a pop (no trailing connector line): on a
+ * dense calendar the head eats hundreds of cells, so a connector per bubble
+ * added hundreds of extra animated elements -- the dominant cost of the whole
+ * SVG -- for a flourish that read as visual noise at this scale.
  */
 export function renderEventBubble(
   grid: ContributionGrid,
   steps: readonly SnakePathStep[],
-  bodyLength: number,
+  _bodyLength: number,
 ): string {
   if (steps.length === 0) return "";
 
-  const { stepDurationMs, loopResetPauseMs, eventBubble } = ANIMATION_TIMING;
+  const { stepDurationMs, loopResetPauseMs } = ANIMATION_TIMING;
   const stepDurationsMs = computeStepDurationsMs(steps, stepDurationMs);
   const { absoluteTimesMs, totalDurationMs } = buildLoopTimeline(stepDurationsMs, loopResetPauseMs);
 
@@ -98,9 +91,6 @@ export function renderEventBubble(
     const peakOpacity = EVENT_BUBBLE_OPACITY_BY_LEVEL[level];
     const bubbleCenter = headPositions[index]!;
 
-    const tailIndex = Math.max(0, index - bodyLength);
-    const tailPosition = headPositions[tailIndex]!;
-
     const spikeStartMs = absoluteTimesMs[index]!;
     const { keyTimes, values } = buildOpacitySpike(spikeStartMs, totalDurationMs, peakOpacity);
 
@@ -109,30 +99,6 @@ export function renderEventBubble(
         animateOpacity(keyTimes, values, totalDurationMs) +
         `</circle>`,
     );
-
-    // Connector: animates its far end from the bubble toward the tail over
-    // the "connector travel" window, and fades out with the bubble.
-    const travelStartMs = spikeStartMs + eventBubble.fadeInMs + eventBubble.holdMs;
-    const travelEndMs = travelStartMs + eventBubble.connectorTravelMs;
-    const connectorLength = distance(bubbleCenter, tailPosition);
-    if (connectorLength > 0) {
-      const dashKeyTimes = [
-        0,
-        Math.min(1, travelStartMs / totalDurationMs),
-        Math.min(1, travelEndMs / totalDurationMs),
-        1,
-      ];
-      const dashValues = [connectorLength, connectorLength, 0, 0];
-      elements.push(
-        `<line x1="${bubbleCenter.x}" y1="${bubbleCenter.y}" x2="${tailPosition.x}" y2="${tailPosition.y}" ` +
-          `stroke="${EVENT_CONNECTOR_COLOR}" stroke-opacity="${EVENT_CONNECTOR_OPACITY}" stroke-width="1" ` +
-          `stroke-dasharray="${connectorLength}" opacity="0">` +
-          animateOpacity(keyTimes, values, totalDurationMs) +
-          `<animate attributeName="stroke-dashoffset" values="${dashValues.join(";")}" ` +
-          `keyTimes="${dashKeyTimes.join(";")}" dur="${totalDurationMs}ms" repeatCount="indefinite" calcMode="linear"/>` +
-          `</line>`,
-      );
-    }
   }
 
   return `<g id="wolverine-event-bubbles">${elements.join("")}</g>`;

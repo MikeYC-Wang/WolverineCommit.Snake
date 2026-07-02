@@ -6,10 +6,10 @@ Instead of just a snake, think of it as a small event-driven system running on y
 
 - **The head is a Command.** Wherever the head moves next, a Command is being dispatched to a Handler.
 - **Eating a cell is a Handler processing it.** Each contribution cell is a unit of work waiting to be handled.
-- **The body is the message bus.** Fixed-length, dashed connectors between nodes — a trail of messages in flight, not an ever-growing game-of-Snake tail.
-- **Eating triggers an Event.** A small amber bubble appears at the eaten cell and travels back toward the tail, like a domain event being published and delivered to a downstream subscriber.
+- **The body is the message bus.** A fixed-length body glides along behind the head — a trail of messages in flight, not an ever-growing game-of-Snake tail.
+- **Eating triggers an Event.** A small amber bubble pops at the eaten cell as it is consumed, like a domain event being published downstream.
 
-The snake only travels between cells that actually have contributions — empty days are skipped entirely, with the movement tweened smoothly between stops rather than marched across every grid line.
+The snake crawls the whole contribution grid one cell at a time — a true, contiguous Snake that can never overlap its own body or detach from it — eating each contribution cell as it sweeps over it.
 
 ## Usage
 

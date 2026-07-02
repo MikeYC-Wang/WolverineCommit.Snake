@@ -57,7 +57,7 @@ function renderSvgDocument(
   snakeMarkup: string,
 ): string {
   return [
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
+    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
     gridMarkup,
     bubbleMarkup,
     snakeMarkup,
