@@ -475,4 +475,142 @@ describe("renderSnake", () => {
       expect(eighthCycleGap).toBeCloseTo(secondCycleGap, 5);
     });
   });
+
+  describe("growth-phase lag blending (frozen-tail fix on sparse-then-dense grids)", () => {
+    // Mirrors a real GitHub calendar where the year opens sparse (a few
+    // far-apart contributions, i.e. long jumps) before settling into a dense
+    // run. `bodyLength` is chosen so the last segment's growth phase
+    // (stepIndex 0..stepLag-1) spans exactly the three sparse jumps below,
+    // which is precisely the shape that used to freeze: with the old
+    // "clamp startMs to 0" formula, a body segment with stepIndex < stepLag
+    // had its lag equal to *all* elapsed time since the loop began, pinning
+    // its target to the start cell for the whole sparse region.
+    const sparseHopCounts = [25, 30, 22];
+    const denseStepCount = 20;
+    const stepLag = sparseHopCounts.length; // 3: growth phase == exactly the sparse jumps
+
+    function buildSparseThenDenseSteps(): SnakePathStep[] {
+      const steps: SnakePathStep[] = [jumpStep([[0, 0]])];
+      let week = 0;
+      for (const hopCount of sparseHopCounts) {
+        const path: Array<[number, number]> = [];
+        for (let hop = 0; hop <= hopCount; hop += 1) path.push([week + hop, 0]);
+        week += hopCount;
+        steps.push(jumpStep(path));
+      }
+      for (let i = 1; i <= denseStepCount; i += 1) {
+        const fromDay = (i - 1) % 7;
+        const toDay = i % 7;
+        steps.push(jumpStep([[week, fromDay], [week, toDay]]));
+      }
+      return steps;
+    }
+
+    function distance(a: Point, b: Point): number {
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    }
+
+    /** Longest run of consecutive identical positions within `positions`. */
+    function longestStaticRun(positions: readonly Point[]): number {
+      let longest = 1;
+      let current = 1;
+      for (let i = 1; i < positions.length; i += 1) {
+        if (positions[i]!.x === positions[i - 1]!.x && positions[i]!.y === positions[i - 1]!.y) {
+          current += 1;
+          longest = Math.max(longest, current);
+        } else {
+          current = 1;
+        }
+      }
+      return longest;
+    }
+
+    it("does not freeze the growing body segment at the start cell through the whole sparse region", () => {
+      const steps = buildSparseThenDenseSteps();
+      const bodyLength = stepLag;
+      const svg = renderSnake(steps, bodyLength);
+
+      const boundaryFrame = stepBoundaryFrameIndices(steps);
+      // Every hop-frame belonging to step indices [0, stepLag) is the
+      // segment's growth phase -- i.e. everything up to (and including)
+      // the last hop of step `stepLag - 1`.
+      const growthEndFrame = boundaryFrame[stepLag - 1]!;
+
+      const segment = stepLag - 1; // the last body segment: full growth phase == the 3 sparse jumps
+      const positions = parseNodePositions(svg, `wolverine-snake-body-${segment}`);
+      const headPositions = parseNodePositions(svg, "wolverine-snake-head");
+
+      const growthPositions = positions.slice(0, growthEndFrame + 1);
+      const staticRun = longestStaticRun(growthPositions);
+
+      // Before the fix, the segment sat frozen at the start cell for
+      // essentially the entire sparse region (tens of consecutive frames,
+      // one per hop of the two ~25-30-hop jumps). After the fix it should
+      // move on virtually every hop instead.
+      expect(staticRun).toBeLessThan(3);
+      expect(growthPositions.length).toBeGreaterThan(40); // sanity: the sparse region really does span this many hop-frames
+
+      // The segment should also track reasonably close to the head
+      // throughout the growth phase, rather than being pinned to the
+      // start cell (far away from wherever the head currently is).
+      const startCell = positions[0]!;
+      let framesPinnedToStart = 0;
+      for (let i = 1; i <= growthEndFrame; i += 1) {
+        if (positions[i]!.x === startCell.x && positions[i]!.y === startCell.y) framesPinnedToStart += 1;
+        const distToHead = distance(positions[i]!, headPositions[i]!);
+        const distStartToHead = distance(startCell, headPositions[i]!);
+        // The segment must never be *farther* from the head than the
+        // frozen start cell itself would be -- i.e. it's always at least
+        // as "grown in" as the old broken behavior, generally much closer.
+        expect(distToHead).toBeLessThanOrEqual(distStartToHead + 1e-9);
+      }
+      // At most a handful of early frames (near stepIndex 0, where the lag
+      // is genuinely still ~0) may legitimately coincide with the start
+      // cell -- it must not be the whole sparse region.
+      expect(framesPinnedToStart).toBeLessThan(growthEndFrame * 0.5);
+    });
+
+    it("keeps the stepIndex === stepLag handoff continuous (no discontinuity beyond the head's own speed cap)", () => {
+      const steps = buildSparseThenDenseSteps();
+      const bodyLength = stepLag;
+      const svg = renderSnake(steps, bodyLength);
+
+      const frameTimesMs = frameTimesMsOf(svg);
+      const headPositions = parseNodePositions(svg, "wolverine-snake-head");
+      const headMaxSpeed = maxSpeedPxPerMs(headPositions, frameTimesMs);
+      expect(headMaxSpeed).toBeGreaterThan(0);
+
+      const segment = stepLag - 1;
+      const bodyPositions = parseNodePositions(svg, `wolverine-snake-body-${segment}`);
+
+      const boundaryFrame = stepBoundaryFrameIndices(steps);
+      // Last hop-frame of step (stepLag - 1) -- still in the growth branch
+      // (stepIndex === stepLag - 1 < stepLag) -- immediately followed by
+      // the first hop-frame of step stepLag, where `lagDurationMs` switches
+      // over to the exact (already-validated) steady-state formula.
+      const lastGrowthFrame = boundaryFrame[stepLag - 1]!;
+      const firstExactFrame = lastGrowthFrame + 1;
+
+      const before = bodyPositions[lastGrowthFrame]!;
+      const after = bodyPositions[firstExactFrame]!;
+      const dt = frameTimesMs[firstExactFrame]! - frameTimesMs[lastGrowthFrame]!;
+      const jumpDistancePx = distance(before, after);
+      const impliedSpeed = dt > 0 ? jumpDistancePx / dt : 0;
+
+      const tolerance = 1e-9;
+      expect(impliedSpeed).toBeLessThanOrEqual(headMaxSpeed + tolerance);
+    });
+
+    it("coincides every body segment with the head's own start position at stepIndex 0", () => {
+      const steps = buildSparseThenDenseSteps();
+      const bodyLength = 6;
+      const svg = renderSnake(steps, bodyLength);
+
+      const headPositions = parseNodePositions(svg, "wolverine-snake-head");
+      for (let segment = 0; segment < bodyLength; segment += 1) {
+        const bodyPositions = parseNodePositions(svg, `wolverine-snake-body-${segment}`);
+        expect(bodyPositions[0]).toEqual(headPositions[0]);
+      }
+    });
+  });
 });

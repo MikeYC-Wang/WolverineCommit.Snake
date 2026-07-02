@@ -116,16 +116,61 @@ function waypointPosition(steps: readonly SnakePathStep[], stepIndex: number, ho
  * Real elapsed duration (ms) of the `stepLag` steps immediately preceding
  * (and including) `stepIndex`, i.e. the amount of real time the head spent
  * covering the same ground a `stepLag`-behind body segment must eventually
- * retrace. Steps before index 0 don't exist, so the sum is naturally
- * truncated (not padded) once it runs past the start of the loop -- see
- * `headPositionAtTime`'s clamping for why that's the correct behavior rather
- * than an approximation.
+ * retrace. `frameTimeMs` is the hop-frame's own absolute time (always
+ * `<= absoluteTimesMs[stepIndex]`), needed for the growth-phase blend below.
+ *
+ * Once `stepIndex >= stepLag` there's a real, exact answer: the timestamp
+ * `stepLag` steps back genuinely exists in `absoluteTimesMs`, so this is
+ * just `endMs - startMs`.
+ *
+ * Before that (`stepIndex < stepLag`), this segment hasn't accumulated
+ * `stepLag` steps of real history yet -- it's still in its "growth phase",
+ * the classic snake-starts-short-and-grows-as-it-eats look. The naive fix
+ * (clamping the missing `startMs` to `0`, i.e. "step -1 happened at the very
+ * start of the loop") makes the lag equal to *all* elapsed time since the
+ * loop began, which pins this segment's target to the loop's start cell for
+ * its *entire* growth phase. On a real GitHub grid where the year opens
+ * sparse, the first `stepLag` eaten cells can be spread across a huge span
+ * of the board -- i.e. a huge span of real time -- so that growth phase
+ * isn't a quick blip, it's a long, visibly frozen dashed tail (see project
+ * report).
+ *
+ * The fix blends the lag itself from `0` at `stepIndex === 0` (where the
+ * segment must exactly coincide with the head -- the whole snake really is
+ * a single point at the very top of the loop) up towards its full value as
+ * `stepIndex` approaches `stepLag`, using `lag = frameTimeMs * (stepIndex /
+ * stepLag)`. Scaling directly against this *frame's own* elapsed time
+ * (rather than, say, the step's end time, or an estimate of the eventual
+ * full-lag duration read ahead from `absoluteTimesMs[stepLag]`) is what
+ * guarantees the fix actually holds: since `stepIndex / stepLag < 1`
+ * whenever this branch runs, the resulting lag is always *strictly less
+ * than* `frameTimeMs` itself, so `frameTimeMs - lag` can never go negative
+ * and hit `headPositionAtTime`'s start-of-loop clamp -- the segment is
+ * mathematically guaranteed to keep advancing every single hop rather than
+ * freezing. (An earlier version of this fix scaled a fixed, precomputed
+ * "full lag once grown" figure by `stepIndex / stepLag` instead; that
+ * over-corrected whenever later steps in the loop were much longer than
+ * earlier ones, since the fixed figure could exceed the *current* step's
+ * own elapsed time and reintroduce multi-hop freezes within the growth
+ * phase itself -- exactly the bug this fix exists to remove.) At
+ * `stepIndex === 0`, `frameTimeMs` is itself `0`, so the lag is `0`
+ * regardless -- matching the required "segment coincides with head" state
+ * at the very top of the loop.
  */
-function lagDurationMs(absoluteTimesMs: readonly number[], stepIndex: number, stepLag: number): number {
-  const endMs = absoluteTimesMs[stepIndex] ?? 0;
+function lagDurationMs(
+  absoluteTimesMs: readonly number[],
+  stepIndex: number,
+  stepLag: number,
+  frameTimeMs: number,
+): number {
   const startIndex = stepIndex - stepLag;
-  const startMs = startIndex >= 0 ? absoluteTimesMs[startIndex]! : 0;
-  return endMs - startMs;
+  if (startIndex >= 0) {
+    const endMs = absoluteTimesMs[stepIndex] ?? 0;
+    return endMs - absoluteTimesMs[startIndex]!;
+  }
+
+  const growthProgress = stepLag > 0 ? stepIndex / stepLag : 1;
+  return frameTimeMs * growthProgress;
 }
 
 /**
@@ -323,7 +368,7 @@ export function renderSnake(steps: readonly SnakePathStep[], bodyLength: number)
    */
   function laggedPositions(stepLag: number): Point[] {
     const idealPositions = hopFrames.map((frame) => {
-      const lagMs = lagDurationMs(absoluteTimesMs, frame.stepIndex, stepLag);
+      const lagMs = lagDurationMs(absoluteTimesMs, frame.stepIndex, stepLag, frame.timeMs);
       const targetTimeMs = frame.timeMs - lagMs;
       return headPositionAtTime(headTimelineTimesMs, extendedHeadPositions, targetTimeMs);
     });
