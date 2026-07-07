@@ -6,7 +6,7 @@ import { cellKey, cellsEqual, type ContributionGrid, type GridCell } from "../ty
  * `bodyLength + 1` orthogonally-adjacent cells and moves exactly one cell per
  * step.
  */
-export const DEFAULT_SNAKE_BODY_LENGTH = 10;
+export const DEFAULT_SNAKE_BODY_LENGTH = 6;
 
 /** Hard runaway guard, as a multiple of the grid's cell count. */
 const SAFETY_MULTIPLIER = 50;
